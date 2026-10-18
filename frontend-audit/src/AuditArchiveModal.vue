@@ -120,7 +120,14 @@
               <section v-if="activeFile" class="aa-file" :data-testid="`audit-file-${activeFile.kind}`">
                 <div class="aa-row aa-muted">
                   <span class="aa-badge" :class="activeFile.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[activeFile.status] }}</span>
-                  <span>zstd {{ formatBytes(activeFile.compressed_size) }} → {{ formatBytes(activeFile.raw_size) }}</span>
+                  <span>{{ formatBytes(activeFile.raw_size) }}</span>
+                  <span v-if="data.archive.storage" data-testid="audit-storage">
+                    {{ text.storage[data.archive.storage.location] }} ·
+                    {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
+                    <template v-if="data.archive.storage.session_compressed_size">
+                      · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
+                    </template>
+                  </span>
                   <span v-if="activeFile.error">{{ activeFile.error }}</span>
                 </div>
                 <div v-if="!activeFile.sections.length" class="aa-state">{{ text.noSections }}</div>

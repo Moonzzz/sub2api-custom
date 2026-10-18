@@ -14,13 +14,17 @@ BIN=/app/sub2api
 ORIG=/app/sub2api.orig
 DIR=/opt/audit
 STATE=${AUDIT_BUILD_DIR:-/app/audit-build}
-ARCHIVE=${AUDIT_ROOT_DIR:-/app/audit}
+ROOT=${AUDIT_ROOT_DIR:-/app/audit}
+ACTIVE=${AUDIT_ACTIVE_DIR:-$ROOT/active}
+ARCHIVE=${AUDIT_ARCHIVE_DIR:-$ROOT/archive}
 
 start() {
     if [ "$(id -u)" = "0" ]; then
-        mkdir -p "$ARCHIVE"
-        # 只修正顶层属主，不递归（归档文件再多也不拖慢启动）
-        chown sub2api:sub2api "$ARCHIVE" 2>/dev/null || true
+        for d in "$ROOT" "$ACTIVE" "$ARCHIVE"; do
+            mkdir -p "$d"
+            # 只修正顶层属主，不递归（归档文件再多也不拖慢启动）
+            chown sub2api:sub2api "$d" 2>/dev/null || true
+        done
     fi
     exec /app/docker-entrypoint.sh "$@"
 }

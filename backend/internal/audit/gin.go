@@ -37,7 +37,9 @@ func Init() *Store {
 			slog.Error("audit_archive_init_failed", "error", err)
 			return
 		}
-		slog.Info("audit_archive_enabled", "root", s.Root())
+		slog.Info("audit_archive_enabled", "active_dir", s.ActiveDir(), "archive_dir", s.ArchiveDir(),
+			"archive_at", cfg.ArchiveAt, "archive_after", cfg.ArchiveAfter)
+		s.Start()
 		defaultStore.Store(s)
 	})
 	return defaultStore.Load()

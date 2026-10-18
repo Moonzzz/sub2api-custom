@@ -34,8 +34,11 @@ services:
     command: ["/app/sub2api"]
     volumes:
       - sub2api_data:/app/data
-      # 归档（容量大时换成宿主机目录，如 /mnt/bigdisk/sub2api-audit:/app/audit）
-      - sub2api_audit:/app/audit
+      # 归档：active 为新请求写入目录（建议 SSD），archive 为夜间合并后的会话归档（可为 HDD）。
+      # 在 .env 中设为宿主机目录即改为绑定挂载，例如
+      #   AUDIT_ACTIVE_PATH=/ssd/sub2api-audit-active  AUDIT_ARCHIVE_PATH=/hdd/sub2api-audit-archive
+      - ${AUDIT_ACTIVE_PATH:-sub2api_audit_active}:/app/audit/active
+      - ${AUDIT_ARCHIVE_PATH:-sub2api_audit_archive}:/app/audit/archive
       # 编译产物缓存（约 120 MB；同版本重启 / 重建容器不再编译）
       - sub2api_audit_build:/app/audit-build
       # 包装脚本与补丁
@@ -128,8 +131,13 @@ services:
 
       # ---- 请求报文归档 ----
       - AUDIT_ENABLED=${AUDIT_ENABLED:-true}
-      - AUDIT_ROOT_DIR=/app/audit
-      - AUDIT_ENCODER_LEVEL=${AUDIT_ENCODER_LEVEL:-fastest}
+      - AUDIT_ACTIVE_DIR=/app/audit/active
+      - AUDIT_ARCHIVE_DIR=/app/audit/archive
+      - AUDIT_ENCODER_LEVEL=${AUDIT_ENCODER_LEVEL:-default}
+      # 每天几点把不再活跃的会话合并到 archive（容器时区，TZ），off 关闭
+      - AUDIT_ARCHIVE_AT=${AUDIT_ARCHIVE_AT:-03:00}
+      # 会话最后一次写入超过该时长才归档
+      - AUDIT_ARCHIVE_AFTER=${AUDIT_ARCHIVE_AFTER:-72h}
       # ---- 启动时编译 ----
       # false：不编译，直接以原版启动
       - AUDIT_PATCH=${AUDIT_PATCH:-true}
@@ -160,7 +168,9 @@ services:
 volumes:
   sub2api_data:
     driver: local
-  sub2api_audit:
+  sub2api_audit_active:
+    driver: local
+  sub2api_audit_archive:
     driver: local
   sub2api_audit_build:
     driver: local

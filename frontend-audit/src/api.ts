@@ -99,8 +99,18 @@ export interface AttemptView {
   response_sections: number[]
 }
 
+export interface StorageInfo {
+  location: 'active' | 'archive' | 'missing'
+  status: string
+  error?: string
+  compressed_size: number
+  session_compressed_size?: number
+  raw_size: number
+}
+
 export interface ArchiveView {
   ref: string
+  storage?: StorageInfo
   files: FileView[]
   summary: Record<string, any>
   attempts: AttemptView[]

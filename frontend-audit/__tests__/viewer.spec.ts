@@ -19,6 +19,7 @@ function archive(usageId: number, ref: string) {
     ref,
     archive: {
       ref,
+      storage: { location: 'archive', status: 'ok', compressed_size: 2048, session_compressed_size: 4096, raw_size: 8192 },
       status: 'complete',
       summary: { request_id: `req-${usageId}`, session_id: 'sess', trace: { trace_id: 't', span_id: 's', source: 'generated' } },
       attempts: [{ seq: 1, account_id: 2, status: 200, complete: true, request_sections: [0], response_sections: [0] }],
@@ -54,6 +55,9 @@ describe('archive viewer', () => {
     await flushPromises()
     expect(fetchUsageArchive).toHaveBeenCalledWith(7, undefined, expect.anything())
     expect(document.body.querySelector('[data-testid="audit-archive-status"]')?.textContent).toContain('完整')
+    const storage = document.body.querySelector('[data-testid="audit-storage"]')?.textContent ?? ''
+    expect(storage).toContain('archive（会话整体压缩）')
+    expect(storage).toContain('会话文件')
     // 正文原文交给编辑器（Monaco 以替身运行），由编辑器内置格式化排版
     await vi.waitFor(() => expect(document.body.textContent).toContain('"usage": 7'))
   })

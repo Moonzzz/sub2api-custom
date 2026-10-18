@@ -7,15 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 
 	"github.com/cespare/xxhash/v2"
 )
 
-// ArchiveView 是一次客户端请求的完整归档视图（四份文件 + 调度尝试汇总）。
+// ArchiveView 是一次客户端请求的完整归档视图（四个阶段 + 调度尝试汇总）。
 type ArchiveView struct {
 	Ref      string         `json:"ref"`
+	Storage  StorageInfo    `json:"storage"`
 	Files    []*FileView    `json:"files"`
 	Summary  map[string]any `json:"summary"`
 	Attempts []AttemptView  `json:"attempts"`
@@ -40,7 +40,8 @@ type AttemptView struct {
 	RespIdx    []int  `json:"response_sections"`
 }
 
-// ReadArchive 读取并解析某个归档引用下的四份文件。
+// ReadArchive 读取并解析某个请求的四个阶段（先 active，后 archive）。
+// 一次解压同时得到四个阶段，客户端请求体、上游请求体、响应体共用同一次读取。
 func (s *Store) ReadArchive(ref string) (*ArchiveView, error) {
 	if !ValidRef(ref) {
 		return nil, errors.New("audit: invalid archive ref")
@@ -50,22 +51,19 @@ func (s *Store) ReadArchive(ref string) (*ArchiveView, error) {
 	if limit <= 0 {
 		limit = DefaultConfig().DisplayBodyLimit
 	}
+	files, info := s.readViews(ref, limit)
+	av.Files, av.Storage = files, info
 	byKind := map[string]*FileView{}
-	missing := 0
-	for _, kind := range Kinds {
-		p, err := s.FilePath(ref, kind)
-		if err != nil {
-			return nil, err
-		}
-		fv := ReadFile(p, kind, limit)
-		av.Files = append(av.Files, fv)
-		byKind[kind] = fv
-		if fv.Status == "missing" {
-			missing++
-		}
+	for _, fv := range files {
+		byKind[fv.Kind] = fv
 	}
-	if missing == len(Kinds) {
+	if info.Status == "missing" {
 		av.Status = "missing"
+		return av, nil
+	}
+	if info.Status == "empty" {
+		av.Status = "in_progress"
+		av.Issues = append(av.Issues, "not yet flushed (request in progress, or process exited before flush)")
 		return av, nil
 	}
 	s.postProcessWS(byKind)
@@ -94,18 +92,11 @@ func (s *Store) ReadArchive(ref string) (*ArchiveView, error) {
 		av.Summary["usage_notes"] = cw.Notes
 	}
 	av.Status = "complete"
+	if info.Status != "ok" {
+		av.Status = "incomplete"
+		av.Issues = append(av.Issues, fmt.Sprintf("%s: %s %s", info.Location, info.Status, info.Error))
+	}
 	for _, fv := range av.Files {
-		switch fv.Status {
-		case "empty":
-			av.Status = "in_progress"
-			av.Issues = append(av.Issues, fmt.Sprintf("%s: not yet flushed (request in progress, or process exited before flush)", fv.Kind))
-		case "ok":
-		default:
-			if av.Status == "complete" {
-				av.Status = "incomplete"
-			}
-			av.Issues = append(av.Issues, fmt.Sprintf("%s: %s %s", fv.Kind, fv.Status, fv.Error))
-		}
 		for _, sec := range fv.Sections {
 			if sec.End == nil {
 				if av.Status == "complete" {
@@ -230,12 +221,15 @@ type BodyInfo struct {
 // StreamBody 把某段正文原样（或按 Content-Encoding 解码后）流式写出，
 // 全程在内存中解压，不落临时文件。返回写出的字节数。
 func (s *Store) StreamBody(w io.Writer, ref, kind string, index int, decode bool, onHeader func(BodyInfo)) (int64, error) {
-	p, err := s.FilePath(ref, kind)
-	if err != nil {
-		return 0, err
+	if !ValidRef(ref) {
+		return 0, errors.New("audit: invalid archive ref")
+	}
+	ki := kindIndex(kind)
+	if ki < 0 {
+		return 0, errors.New("audit: invalid kind")
 	}
 	// 先扫描一遍取段头/段尾并计算 SHA-256（用于响应头），再流式输出正文。
-	info, err := s.sectionMeta(p, index)
+	info, err := s.sectionMeta(ref, byte(ki), index)
 	if err != nil {
 		return 0, err
 	}
@@ -245,11 +239,11 @@ func (s *Store) StreamBody(w io.Writer, ref, kind string, index int, decode bool
 	}
 	enc := headerValue(hdr.Header, "Content-Encoding")
 	if !decode || enc == "" || enc == "identity" {
-		return s.copySection(w, p, index)
+		return s.copySection(w, ref, byte(ki), index)
 	}
 	pr, pw := io.Pipe()
 	go func() {
-		_, err := s.copySection(pw, p, index)
+		_, err := s.copySection(pw, ref, byte(ki), index)
 		_ = pw.CloseWithError(err)
 	}()
 	rc, err := DecodeReader(enc, pr)
@@ -261,33 +255,14 @@ func (s *Store) StreamBody(w io.Writer, ref, kind string, index int, decode bool
 	return io.Copy(w, rc)
 }
 
-func (s *Store) walkSections(path string, fn func(idx int, f frame) bool) error {
-	f, err := os.Open(path) //nolint:gosec // 已校验
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	dec, err := newDecoder(f)
-	if err != nil {
-		return err
-	}
-	defer dec.Close()
-	fr, err := openFrames(dec)
-	if err != nil {
-		return err
-	}
+// walkSections 遍历请求中某个阶段的帧，idx 为该阶段内的 section 序号。
+func (s *Store) walkSections(ref string, kind byte, fn func(idx int, f frame) bool) error {
 	latest := map[uint16]int{}
 	count := 0
-	var buf []byte
-	for {
-		fx, err := fr.next(buf)
-		if errors.Is(err, io.EOF) {
-			return nil
+	_, err := s.walkRequest(ref, func(fx frame) bool {
+		if fx.kind != kind {
+			return true
 		}
-		if err != nil {
-			return err
-		}
-		buf = fx.payload[:0]
 		idx := -1
 		if fx.typ == FrameHeader {
 			idx = count
@@ -296,19 +271,21 @@ func (s *Store) walkSections(path string, fn func(idx int, f frame) bool) error 
 		} else if v, ok := latest[fx.seq]; ok {
 			idx = v
 		}
-		if idx >= 0 && !fn(idx, fx) {
-			return nil
+		if idx >= 0 {
+			return fn(idx, fx)
 		}
-	}
+		return true
+	})
+	return err
 }
 
-func (s *Store) sectionMeta(path string, index int) (BodyInfo, error) {
+func (s *Store) sectionMeta(ref string, kind byte, index int) (BodyInfo, error) {
 	var hdr SectionHeader
 	var end *SectionEnd
 	found := false
 	sh, xh := sha256.New(), xxhash.New()
 	var n int64
-	err := s.walkSections(path, func(idx int, f frame) bool {
+	err := s.walkSections(ref, kind, func(idx int, f frame) bool {
 		if idx != index {
 			return true
 		}
@@ -340,10 +317,10 @@ func (s *Store) sectionMeta(path string, index int) (BodyInfo, error) {
 	return info, nil
 }
 
-func (s *Store) copySection(w io.Writer, path string, index int) (int64, error) {
+func (s *Store) copySection(w io.Writer, ref string, kind byte, index int) (int64, error) {
 	var n int64
 	var werr error
-	err := s.walkSections(path, func(idx int, f frame) bool {
+	err := s.walkSections(ref, kind, func(idx int, f frame) bool {
 		if idx != index {
 			return true
 		}

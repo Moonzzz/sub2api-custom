@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strconv"
@@ -43,6 +44,8 @@ func RegisterRoutes(g *gin.RouterGroup, lookup UsageLookup) {
 	a.GET("/lookup", handleLookup)
 	a.GET("/archive", handleArchive)
 	a.GET("/body", handleBody)
+	a.GET("/bundle", handleBundle)
+	a.POST("/archive/run", handleRunArchive)
 }
 
 func storeOr503(c *gin.Context) *Store {
@@ -60,7 +63,18 @@ func handleStatus(c *gin.Context) {
 		response.Success(c, gin.H{"enabled": false})
 		return
 	}
-	response.Success(c, gin.H{"enabled": true, "root": s.Root(), "stats": s.StatsSnapshot(), "display_body_limit": s.cfg.DisplayBodyLimit})
+	response.Success(c, gin.H{
+		"enabled":            true,
+		"root":               s.Root(),
+		"active_dir":         s.ActiveDir(),
+		"archive_dir":        s.ArchiveDir(),
+		"archive_after":      s.cfg.ArchiveAfter.String(),
+		"archive_at":         s.cfg.ArchiveAt,
+		"archive_running":    s.ArchiveRunning(),
+		"last_archive":       s.LastArchiveReport(),
+		"stats":              s.StatsSnapshot(),
+		"display_body_limit": s.cfg.DisplayBodyLimit,
+	})
 }
 
 // lookupKeys 用量 request_id 通常为 "client:<客户端请求ID>"；两者都查。
@@ -252,8 +266,8 @@ func handleBody(c *gin.Context) {
 		response.BadRequest(c, "invalid index")
 		return
 	}
-	if _, err := s.FilePath(ref, kind); err != nil {
-		response.BadRequest(c, err.Error())
+	if !ValidRef(ref) || !ValidKind(kind) {
+		response.BadRequest(c, "invalid ref or kind")
 		return
 	}
 	decode := c.Query("decode") == "1"
@@ -289,6 +303,70 @@ func handleBody(c *gin.Context) {
 		}
 		response.NotFound(c, "archive body unavailable: "+err.Error())
 	}
+}
+
+// handleBundle 下载一个请求的全部阶段（单个 zstd 流，格式同 active 请求文件）。
+// 四个阶段共用一次压缩，适合整体传输；请求仍在 active 时直接发送文件字节，不重新压缩。
+func handleBundle(c *gin.Context) {
+	s := storeOr503(c)
+	if s == nil {
+		return
+	}
+	ref := c.Query("ref")
+	if !ValidRef(ref) {
+		response.BadRequest(c, "invalid ref")
+		return
+	}
+	cw := &lazyHeaderWriter{w: c.Writer, onFirst: func() {
+		c.Header("Content-Type", "application/zstd")
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(ref)+".zst"))
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("Cache-Control", "private, no-store")
+		c.Status(http.StatusOK)
+	}}
+	info, err := s.WriteRequestBundle(cw, ref)
+	if err != nil && !cw.started {
+		if errors.Is(err, errRequestNotFound) {
+			response.NotFound(c, "archive not found")
+			return
+		}
+		response.InternalError(c, "archive read failed: "+err.Error())
+		return
+	}
+	_ = info
+}
+
+// lazyHeaderWriter 在第一次写入时才发送响应头，便于出错时仍能返回 JSON 错误。
+type lazyHeaderWriter struct {
+	w       io.Writer
+	onFirst func()
+	started bool
+}
+
+func (l *lazyHeaderWriter) Write(p []byte) (int, error) {
+	if !l.started {
+		l.started = true
+		l.onFirst()
+	}
+	return l.w.Write(p)
+}
+
+// handleRunArchive 立即执行一次夜间归档（同步返回结果；已有归档在执行时返回 409）。
+func handleRunArchive(c *gin.Context) {
+	s := storeOr503(c)
+	if s == nil {
+		return
+	}
+	rep, err := s.RunArchive(c.Request.Context())
+	if errors.Is(err, errArchiveRunning) {
+		response.ErrorWithDetails(c, http.StatusConflict, "archive already running", "AUDIT_ARCHIVE_RUNNING", nil)
+		return
+	}
+	if err != nil {
+		response.InternalError(c, err.Error())
+		return
+	}
+	response.Success(c, rep)
 }
 
 var errSectionNotFound = errors.New("audit: section not found")

@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/main.go b/backend/cmd/server/main.go
-index 8494713ba..2f604adeb 100644
+index 8494713b..2f604ade 100644
 --- a/backend/cmd/server/main.go
 +++ b/backend/cmd/server/main.go
 @@ -16,6 +16,7 @@ import (
@@ -33,7 +33,7 @@ index 8494713ba..2f604adeb 100644
  	log.Println("Server exited")
  }
 diff --git a/backend/go.mod b/backend/go.mod
-index 2e68ebc9a..63b7707d7 100644
+index 2e68ebc9..63b7707d 100644
 --- a/backend/go.mod
 +++ b/backend/go.mod
 @@ -50,6 +50,8 @@ require (
@@ -57,16 +57,17 @@ index 2e68ebc9a..63b7707d7 100644
  	go.uber.org/multierr v1.9.0 // indirect
 diff --git a/backend/internal/audit/api.go b/backend/internal/audit/api.go
 new file mode 100644
-index 000000000..51de0794e
+index 00000000..1f847aad
 --- /dev/null
 +++ b/backend/internal/audit/api.go
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,372 @@
 +package audit
 +
 +import (
 +	"context"
 +	"errors"
 +	"fmt"
++	"io"
 +	"net/http"
 +	"path"
 +	"strconv"
@@ -106,6 +107,8 @@ index 000000000..51de0794e
 +	a.GET("/lookup", handleLookup)
 +	a.GET("/archive", handleArchive)
 +	a.GET("/body", handleBody)
++	a.GET("/bundle", handleBundle)
++	a.POST("/archive/run", handleRunArchive)
 +}
 +
 +func storeOr503(c *gin.Context) *Store {
@@ -123,7 +126,18 @@ index 000000000..51de0794e
 +		response.Success(c, gin.H{"enabled": false})
 +		return
 +	}
-+	response.Success(c, gin.H{"enabled": true, "root": s.Root(), "stats": s.StatsSnapshot(), "display_body_limit": s.cfg.DisplayBodyLimit})
++	response.Success(c, gin.H{
++		"enabled":            true,
++		"root":               s.Root(),
++		"active_dir":         s.ActiveDir(),
++		"archive_dir":        s.ArchiveDir(),
++		"archive_after":      s.cfg.ArchiveAfter.String(),
++		"archive_at":         s.cfg.ArchiveAt,
++		"archive_running":    s.ArchiveRunning(),
++		"last_archive":       s.LastArchiveReport(),
++		"stats":              s.StatsSnapshot(),
++		"display_body_limit": s.cfg.DisplayBodyLimit,
++	})
 +}
 +
 +// lookupKeys 用量 request_id 通常为 "client:<客户端请求ID>"；两者都查。
@@ -315,8 +329,8 @@ index 000000000..51de0794e
 +		response.BadRequest(c, "invalid index")
 +		return
 +	}
-+	if _, err := s.FilePath(ref, kind); err != nil {
-+		response.BadRequest(c, err.Error())
++	if !ValidRef(ref) || !ValidKind(kind) {
++		response.BadRequest(c, "invalid ref or kind")
 +		return
 +	}
 +	decode := c.Query("decode") == "1"
@@ -354,13 +368,77 @@ index 000000000..51de0794e
 +	}
 +}
 +
++// handleBundle 下载一个请求的全部阶段（单个 zstd 流，格式同 active 请求文件）。
++// 四个阶段共用一次压缩，适合整体传输；请求仍在 active 时直接发送文件字节，不重新压缩。
++func handleBundle(c *gin.Context) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	ref := c.Query("ref")
++	if !ValidRef(ref) {
++		response.BadRequest(c, "invalid ref")
++		return
++	}
++	cw := &lazyHeaderWriter{w: c.Writer, onFirst: func() {
++		c.Header("Content-Type", "application/zstd")
++		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(ref)+".zst"))
++		c.Header("X-Content-Type-Options", "nosniff")
++		c.Header("Cache-Control", "private, no-store")
++		c.Status(http.StatusOK)
++	}}
++	info, err := s.WriteRequestBundle(cw, ref)
++	if err != nil && !cw.started {
++		if errors.Is(err, errRequestNotFound) {
++			response.NotFound(c, "archive not found")
++			return
++		}
++		response.InternalError(c, "archive read failed: "+err.Error())
++		return
++	}
++	_ = info
++}
++
++// lazyHeaderWriter 在第一次写入时才发送响应头，便于出错时仍能返回 JSON 错误。
++type lazyHeaderWriter struct {
++	w       io.Writer
++	onFirst func()
++	started bool
++}
++
++func (l *lazyHeaderWriter) Write(p []byte) (int, error) {
++	if !l.started {
++		l.started = true
++		l.onFirst()
++	}
++	return l.w.Write(p)
++}
++
++// handleRunArchive 立即执行一次夜间归档（同步返回结果；已有归档在执行时返回 409）。
++func handleRunArchive(c *gin.Context) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	rep, err := s.RunArchive(c.Request.Context())
++	if errors.Is(err, errArchiveRunning) {
++		response.ErrorWithDetails(c, http.StatusConflict, "archive already running", "AUDIT_ARCHIVE_RUNNING", nil)
++		return
++	}
++	if err != nil {
++		response.InternalError(c, err.Error())
++		return
++	}
++	response.Success(c, rep)
++}
++
 +var errSectionNotFound = errors.New("audit: section not found")
 diff --git a/backend/internal/audit/archive.go b/backend/internal/audit/archive.go
 new file mode 100644
-index 000000000..df7175415
+index 00000000..85fa6171
 --- /dev/null
 +++ b/backend/internal/audit/archive.go
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,347 @@
 +package audit
 +
 +import (
@@ -370,15 +448,15 @@ index 000000000..df7175415
 +	"errors"
 +	"fmt"
 +	"io"
-+	"os"
 +	"sort"
 +
 +	"github.com/cespare/xxhash/v2"
 +)
 +
-+// ArchiveView 是一次客户端请求的完整归档视图（四份文件 + 调度尝试汇总）。
++// ArchiveView 是一次客户端请求的完整归档视图（四个阶段 + 调度尝试汇总）。
 +type ArchiveView struct {
 +	Ref      string         `json:"ref"`
++	Storage  StorageInfo    `json:"storage"`
 +	Files    []*FileView    `json:"files"`
 +	Summary  map[string]any `json:"summary"`
 +	Attempts []AttemptView  `json:"attempts"`
@@ -403,7 +481,8 @@ index 000000000..df7175415
 +	RespIdx    []int  `json:"response_sections"`
 +}
 +
-+// ReadArchive 读取并解析某个归档引用下的四份文件。
++// ReadArchive 读取并解析某个请求的四个阶段（先 active，后 archive）。
++// 一次解压同时得到四个阶段，客户端请求体、上游请求体、响应体共用同一次读取。
 +func (s *Store) ReadArchive(ref string) (*ArchiveView, error) {
 +	if !ValidRef(ref) {
 +		return nil, errors.New("audit: invalid archive ref")
@@ -413,22 +492,19 @@ index 000000000..df7175415
 +	if limit <= 0 {
 +		limit = DefaultConfig().DisplayBodyLimit
 +	}
++	files, info := s.readViews(ref, limit)
++	av.Files, av.Storage = files, info
 +	byKind := map[string]*FileView{}
-+	missing := 0
-+	for _, kind := range Kinds {
-+		p, err := s.FilePath(ref, kind)
-+		if err != nil {
-+			return nil, err
-+		}
-+		fv := ReadFile(p, kind, limit)
-+		av.Files = append(av.Files, fv)
-+		byKind[kind] = fv
-+		if fv.Status == "missing" {
-+			missing++
-+		}
++	for _, fv := range files {
++		byKind[fv.Kind] = fv
 +	}
-+	if missing == len(Kinds) {
++	if info.Status == "missing" {
 +		av.Status = "missing"
++		return av, nil
++	}
++	if info.Status == "empty" {
++		av.Status = "in_progress"
++		av.Issues = append(av.Issues, "not yet flushed (request in progress, or process exited before flush)")
 +		return av, nil
 +	}
 +	s.postProcessWS(byKind)
@@ -457,18 +533,11 @@ index 000000000..df7175415
 +		av.Summary["usage_notes"] = cw.Notes
 +	}
 +	av.Status = "complete"
++	if info.Status != "ok" {
++		av.Status = "incomplete"
++		av.Issues = append(av.Issues, fmt.Sprintf("%s: %s %s", info.Location, info.Status, info.Error))
++	}
 +	for _, fv := range av.Files {
-+		switch fv.Status {
-+		case "empty":
-+			av.Status = "in_progress"
-+			av.Issues = append(av.Issues, fmt.Sprintf("%s: not yet flushed (request in progress, or process exited before flush)", fv.Kind))
-+		case "ok":
-+		default:
-+			if av.Status == "complete" {
-+				av.Status = "incomplete"
-+			}
-+			av.Issues = append(av.Issues, fmt.Sprintf("%s: %s %s", fv.Kind, fv.Status, fv.Error))
-+		}
 +		for _, sec := range fv.Sections {
 +			if sec.End == nil {
 +				if av.Status == "complete" {
@@ -593,12 +662,15 @@ index 000000000..df7175415
 +// StreamBody 把某段正文原样（或按 Content-Encoding 解码后）流式写出，
 +// 全程在内存中解压，不落临时文件。返回写出的字节数。
 +func (s *Store) StreamBody(w io.Writer, ref, kind string, index int, decode bool, onHeader func(BodyInfo)) (int64, error) {
-+	p, err := s.FilePath(ref, kind)
-+	if err != nil {
-+		return 0, err
++	if !ValidRef(ref) {
++		return 0, errors.New("audit: invalid archive ref")
++	}
++	ki := kindIndex(kind)
++	if ki < 0 {
++		return 0, errors.New("audit: invalid kind")
 +	}
 +	// 先扫描一遍取段头/段尾并计算 SHA-256（用于响应头），再流式输出正文。
-+	info, err := s.sectionMeta(p, index)
++	info, err := s.sectionMeta(ref, byte(ki), index)
 +	if err != nil {
 +		return 0, err
 +	}
@@ -608,11 +680,11 @@ index 000000000..df7175415
 +	}
 +	enc := headerValue(hdr.Header, "Content-Encoding")
 +	if !decode || enc == "" || enc == "identity" {
-+		return s.copySection(w, p, index)
++		return s.copySection(w, ref, byte(ki), index)
 +	}
 +	pr, pw := io.Pipe()
 +	go func() {
-+		_, err := s.copySection(pw, p, index)
++		_, err := s.copySection(pw, ref, byte(ki), index)
 +		_ = pw.CloseWithError(err)
 +	}()
 +	rc, err := DecodeReader(enc, pr)
@@ -624,33 +696,14 @@ index 000000000..df7175415
 +	return io.Copy(w, rc)
 +}
 +
-+func (s *Store) walkSections(path string, fn func(idx int, f frame) bool) error {
-+	f, err := os.Open(path) //nolint:gosec // 已校验
-+	if err != nil {
-+		return err
-+	}
-+	defer func() { _ = f.Close() }()
-+	dec, err := newDecoder(f)
-+	if err != nil {
-+		return err
-+	}
-+	defer dec.Close()
-+	fr, err := openFrames(dec)
-+	if err != nil {
-+		return err
-+	}
++// walkSections 遍历请求中某个阶段的帧，idx 为该阶段内的 section 序号。
++func (s *Store) walkSections(ref string, kind byte, fn func(idx int, f frame) bool) error {
 +	latest := map[uint16]int{}
 +	count := 0
-+	var buf []byte
-+	for {
-+		fx, err := fr.next(buf)
-+		if errors.Is(err, io.EOF) {
-+			return nil
++	_, err := s.walkRequest(ref, func(fx frame) bool {
++		if fx.kind != kind {
++			return true
 +		}
-+		if err != nil {
-+			return err
-+		}
-+		buf = fx.payload[:0]
 +		idx := -1
 +		if fx.typ == FrameHeader {
 +			idx = count
@@ -659,19 +712,21 @@ index 000000000..df7175415
 +		} else if v, ok := latest[fx.seq]; ok {
 +			idx = v
 +		}
-+		if idx >= 0 && !fn(idx, fx) {
-+			return nil
++		if idx >= 0 {
++			return fn(idx, fx)
 +		}
-+	}
++		return true
++	})
++	return err
 +}
 +
-+func (s *Store) sectionMeta(path string, index int) (BodyInfo, error) {
++func (s *Store) sectionMeta(ref string, kind byte, index int) (BodyInfo, error) {
 +	var hdr SectionHeader
 +	var end *SectionEnd
 +	found := false
 +	sh, xh := sha256.New(), xxhash.New()
 +	var n int64
-+	err := s.walkSections(path, func(idx int, f frame) bool {
++	err := s.walkSections(ref, kind, func(idx int, f frame) bool {
 +		if idx != index {
 +			return true
 +		}
@@ -703,10 +758,10 @@ index 000000000..df7175415
 +	return info, nil
 +}
 +
-+func (s *Store) copySection(w io.Writer, path string, index int) (int64, error) {
++func (s *Store) copySection(w io.Writer, ref string, kind byte, index int) (int64, error) {
 +	var n int64
 +	var werr error
-+	err := s.walkSections(path, func(idx int, f frame) bool {
++	err := s.walkSections(ref, kind, func(idx int, f frame) bool {
 +		if idx != index {
 +			return true
 +		}
@@ -731,15 +786,539 @@ index 000000000..df7175415
 +}
 +
 +var jsonUnmarshal = json.Unmarshal
+diff --git a/backend/internal/audit/archiver.go b/backend/internal/audit/archiver.go
+new file mode 100644
+index 00000000..e2970dba
+--- /dev/null
++++ b/backend/internal/audit/archiver.go
+@@ -0,0 +1,514 @@
++package audit
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++// 夜间归档：把 active 中不再活跃的会话合并进 archive 的单个会话文件。
++//
++//   - 只遍历 active（最多保留约 ArchiveAfter 时长的数据），不扫描 archive；
++//     active 中的每个会话目录都是候选，会话目录本身就是“重激活记录”。
++//   - 会话最后活跃时间 = 目录与其中文件的最大 mtime，请求路径上无需额外记录。
++//   - 已有归档（会话被重激活过）时，流式解压旧归档并接上 active 中的新请求，
++//     作为一条完整的 zstd 流重新压缩（保留跨请求去重），不在 active 落地解压。
++//   - 写临时文件 → fsync → rename 覆盖 → fsync 目录 → 删除 active；
++//     中途崩溃时以 active 为准重做，合并时按请求引用去重，不会重复写入。
++//   - 会话正在写入（持有会话写入锁）即说明仍活跃，本轮跳过。
++
++// ArchiveReport 是一次归档执行的结果。
++type ArchiveReport struct {
++	StartedAt  time.Time `json:"started_at"`
++	FinishedAt time.Time `json:"finished_at"`
++	Cutoff     time.Time `json:"cutoff"`
++	// Sessions 本次归档的会话数，其中 Merged 个与已有归档合并（重激活会话）。
++	Sessions int `json:"sessions"`
++	Merged   int `json:"merged"`
++	Requests int `json:"requests"`
++	// Active 跳过的仍活跃会话数；Busy 跳过的正在写入的会话数。
++	Active int `json:"active"`
++	Busy   int `json:"busy"`
++	Failed int `json:"failed"`
++	// ActiveBytes 从 active 移出的压缩字节；ArchiveBytes 写出的会话文件总大小（含合并的旧内容）。
++	ActiveBytes  int64    `json:"active_bytes"`
++	ArchiveBytes int64    `json:"archive_bytes"`
++	Errors       []string `json:"errors,omitempty"`
++	Cancelled    bool     `json:"cancelled,omitempty"`
++}
++
++func (r *ArchiveReport) addError(format string, args ...any) {
++	if len(r.Errors) < 50 {
++		r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
++	}
++}
++
++// sessionFrameLimit 单个 zstd frame 的原始数据上限；超过后另起一个 frame 继续写
++// （同一文件内多个 frame 依旧是一条可顺序解压的流），只是兜底，正常会话远小于此值。
++const sessionFrameLimit = 1 << 30
++
++type archiver struct {
++	s       *Store
++	runMu   sync.Mutex // 同一时刻只执行一次归档
++	running atomic.Bool
++	last    atomic.Pointer[ArchiveReport]
++
++	startOnce sync.Once
++	stopOnce  sync.Once
++	ctx       context.Context
++	cancel    context.CancelFunc
++	wg        sync.WaitGroup
++}
++
++func newArchiver(s *Store) *archiver {
++	ctx, cancel := context.WithCancel(context.Background())
++	return &archiver{s: s, ctx: ctx, cancel: cancel}
++}
++
++// Start 启动每日定时归档（ArchiveAt，默认 03:00；"off" 表示关闭）。可重复调用。
++func (s *Store) Start() {
++	a := s.archiver
++	at := strings.TrimSpace(strings.ToLower(s.cfg.ArchiveAt))
++	if at == "off" || at == "disabled" || at == "false" {
++		slog.Info("audit_archive_schedule_disabled")
++		return
++	}
++	hour, minute, err := parseClock(at)
++	if err != nil {
++		slog.Warn("audit_archive_schedule_invalid", "archive_at", s.cfg.ArchiveAt, "error", err)
++		hour, minute = 3, 0
++	}
++	a.startOnce.Do(func() {
++		a.wg.Add(1)
++		go a.loop(hour, minute)
++	})
++}
++
++func (a *archiver) loop(hour, minute int) {
++	defer a.wg.Done()
++	for {
++		now := a.s.now()
++		next := nextClock(now, hour, minute)
++		t := time.NewTimer(next.Sub(now))
++		select {
++		case <-a.ctx.Done():
++			t.Stop()
++			return
++		case <-t.C:
++		}
++		rep, err := a.s.RunArchive(a.ctx)
++		if err != nil {
++			slog.Warn("audit_archive_run_failed", "error", err)
++			continue
++		}
++		slog.Info("audit_archive_run_done",
++			"sessions", rep.Sessions, "merged", rep.Merged, "requests", rep.Requests,
++			"active_skipped", rep.Active, "busy_skipped", rep.Busy, "failed", rep.Failed,
++			"active_bytes", rep.ActiveBytes, "archive_bytes", rep.ArchiveBytes,
++			"elapsed", rep.FinishedAt.Sub(rep.StartedAt).Round(time.Millisecond))
++	}
++}
++
++func (a *archiver) stop() {
++	a.stopOnce.Do(func() {
++		a.cancel()
++		a.wg.Wait()
++	})
++}
++
++func parseClock(v string) (int, int, error) {
++	t, err := time.Parse("15:04", v)
++	if err != nil {
++		return 0, 0, err
++	}
++	return t.Hour(), t.Minute(), nil
++}
++
++// nextClock 返回 now 之后（不含）最近一次的本地 hour:minute。
++func nextClock(now time.Time, hour, minute int) time.Time {
++	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
++	if !next.After(now) {
++		next = next.AddDate(0, 0, 1)
++	}
++	return next
++}
++
++// LastArchiveReport 返回最近一次归档的结果（尚未执行时为 nil）。
++func (s *Store) LastArchiveReport() *ArchiveReport { return s.archiver.last.Load() }
++
++// ArchiveRunning 表示归档正在执行。
++func (s *Store) ArchiveRunning() bool { return s.archiver.running.Load() }
++
++// errArchiveRunning 表示已有归档在执行。
++var errArchiveRunning = errors.New("audit: archive already running")
++
++// RunArchive 立即执行一次归档：处理最后活跃时间早于 now-ArchiveAfter 的会话。
++func (s *Store) RunArchive(ctx context.Context) (*ArchiveReport, error) {
++	return s.ArchiveBefore(ctx, s.now().Add(-s.cfg.ArchiveAfter))
++}
++
++// ArchiveBefore 归档最后活跃时间早于 cutoff 的会话。
++func (s *Store) ArchiveBefore(ctx context.Context, cutoff time.Time) (*ArchiveReport, error) {
++	a := s.archiver
++	if !a.runMu.TryLock() {
++		return nil, errArchiveRunning
++	}
++	defer a.runMu.Unlock()
++	a.running.Store(true)
++	defer a.running.Store(false)
++
++	rep := &ArchiveReport{StartedAt: s.now(), Cutoff: cutoff}
++	dirs, err := s.listActiveSessions()
++	if err != nil {
++		return nil, err
++	}
++	for _, rel := range dirs {
++		if ctx.Err() != nil {
++			rep.Cancelled = true
++			break
++		}
++		s.archiveSession(ctx, rel, cutoff, rep)
++	}
++	rep.FinishedAt = s.now()
++	a.last.Store(rep)
++	return rep, nil
++}
++
++var (
++	monthDirRE    = regexp.MustCompile(`^\d{4}-\d{2}$`)
++	dayDirRE      = regexp.MustCompile(`^\d{2}$`)
++	requestFileRE = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]{0,95}-\d{1,6})\.zst$`)
++)
++
++// listActiveSessions 列出 active 中的会话目录（{yyyy-MM}/{dd}/{session}），按路径排序。
++// 只遍历三层目录名，不读取文件。
++func (s *Store) listActiveSessions() ([]string, error) {
++	var out []string
++	months, err := os.ReadDir(s.activeDir)
++	if err != nil {
++		return nil, err
++	}
++	for _, m := range months {
++		if !m.IsDir() || !monthDirRE.MatchString(m.Name()) {
++			continue
++		}
++		days, err := os.ReadDir(filepath.Join(s.activeDir, m.Name()))
++		if err != nil {
++			continue
++		}
++		for _, d := range days {
++			if !d.IsDir() || !dayDirRE.MatchString(d.Name()) {
++				continue
++			}
++			sessions, err := os.ReadDir(filepath.Join(s.activeDir, m.Name(), d.Name()))
++			if err != nil {
++				continue
++			}
++			for _, se := range sessions {
++				if se.IsDir() && safeNameRE.MatchString(se.Name()) {
++					out = append(out, m.Name()+"/"+d.Name()+"/"+se.Name())
++				}
++			}
++		}
++	}
++	sort.Strings(out)
++	return out, nil
++}
++
++type activeFile struct {
++	base  string // {requestId}-{n}
++	path  string
++	size  int64
++	mtime time.Time
++}
++
++// archiveSession 归档单个会话；结果累加到 rep。
++func (s *Store) archiveSession(ctx context.Context, rel string, cutoff time.Time, rep *ArchiveReport) {
++	unlock := s.locks.TryLock(rel)
++	if unlock == nil {
++		rep.Busy++
++		return
++	}
++	defer unlock()
++
++	dir := filepath.Join(s.activeDir, filepath.FromSlash(rel))
++	files, last, err := scanActiveSession(dir)
++	if err != nil {
++		rep.Failed++
++		rep.addError("%s: scan: %v", rel, err)
++		return
++	}
++	if last.After(cutoff) {
++		rep.Active++
++		return
++	}
++	if len(files) == 0 {
++		removeEmptyDirs(s.activeDir, dir)
++		return
++	}
++	merged, size, err := s.writeSessionArchive(ctx, rel, files)
++	if err != nil {
++		rep.Failed++
++		rep.addError("%s: %v", rel, err)
++		slog.Warn("audit_archive_session_failed", "session_dir", rel, "error", err)
++		return
++	}
++	rep.Sessions++
++	if merged {
++		rep.Merged++
++	}
++	rep.Requests += len(files)
++	rep.ArchiveBytes += size
++	for _, f := range files {
++		if err := os.Remove(f.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
++			rep.addError("%s: remove %s: %v", rel, f.base, err)
++			continue
++		}
++		rep.ActiveBytes += f.size
++	}
++	removeEmptyDirs(s.activeDir, dir)
++}
++
++// scanActiveSession 列出会话目录中的请求文件，并返回最后活跃时间（目录与文件 mtime 的最大值）。
++func scanActiveSession(dir string) ([]activeFile, time.Time, error) {
++	st, err := os.Stat(dir)
++	if err != nil {
++		return nil, time.Time{}, err
++	}
++	last := st.ModTime()
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return nil, last, err
++	}
++	var files []activeFile
++	for _, e := range entries {
++		m := requestFileRE.FindStringSubmatch(e.Name())
++		if m == nil || !e.Type().IsRegular() {
++			continue
++		}
++		info, err := e.Info()
++		if err != nil {
++			continue
++		}
++		if info.ModTime().After(last) {
++			last = info.ModTime()
++		}
++		files = append(files, activeFile{base: m[1], path: filepath.Join(dir, e.Name()), size: info.Size(), mtime: info.ModTime()})
++	}
++	// 按完成时间排序：相邻请求的上下文重叠最多，紧挨着写入去重效果最好。
++	sort.Slice(files, func(i, j int) bool {
++		if !files[i].mtime.Equal(files[j].mtime) {
++			return files[i].mtime.Before(files[j].mtime)
++		}
++		return files[i].base < files[j].base
++	})
++	return files, last, nil
++}
++
++// removeEmptyDirs 自下而上删除空目录，直到 root（不含）。
++func removeEmptyDirs(root, dir string) {
++	for dir != root && strings.HasPrefix(dir, root+string(filepath.Separator)) {
++		if os.Remove(dir) != nil {
++			return
++		}
++		dir = filepath.Dir(dir)
++	}
++}
++
++// sessionWriter 把帧写入会话归档的压缩流，并在原始数据超过上限时另起 zstd frame。
++type sessionWriter struct {
++	enc   *zstd.Encoder
++	inner io.Writer
++	raw   int64
++	hdr   []byte
++}
++
++func (w *sessionWriter) frame(typ, kind byte, seq uint16, payload []byte) error {
++	if w.raw >= sessionFrameLimit {
++		if err := w.enc.Close(); err != nil {
++			return err
++		}
++		w.enc.Reset(w.inner)
++		w.raw = 0
++	}
++	w.hdr = encodeFrameHeader(w.hdr[:0], typ, kind, seq, len(payload))
++	if _, err := w.enc.Write(w.hdr); err != nil {
++		return err
++	}
++	if _, err := w.enc.Write(payload); err != nil {
++		return err
++	}
++	w.raw += int64(len(w.hdr) + len(payload))
++	return nil
++}
++
++func (w *sessionWriter) json(typ byte, v any) error {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return err
++	}
++	return w.frame(typ, 0, 0, b)
++}
++
++// writeSessionArchive 生成会话归档：旧归档（若有）+ active 中的请求，写临时文件后原子替换。
++// 返回是否合并了旧归档，以及新文件大小。
++func (s *Store) writeSessionArchive(ctx context.Context, rel string, files []activeFile) (merged bool, size int64, err error) {
++	dst := s.archiveSessionPath(rel)
++	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
++		return false, 0, err
++	}
++	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".tmp-*")
++	if err != nil {
++		return false, 0, err
++	}
++	tmpName := tmp.Name()
++	ok := false
++	defer func() {
++		if !ok {
++			_ = tmp.Close()
++			_ = os.Remove(tmpName)
++		}
++	}()
++
++	bw := bufio.NewWriterSize(tmp, 1<<20)
++	enc, err := zstd.NewWriter(bw, encoderOptions(s.cfg.ArchiveEncoderLevel, s.cfg.ArchiveWindowMB, false)...)
++	if err != nil {
++		return false, 0, err
++	}
++	w := &sessionWriter{enc: enc, inner: bw, hdr: make([]byte, 0, frameHeaderSize)}
++	if _, err := enc.Write([]byte(sessionMagic)); err != nil {
++		_ = enc.Close()
++		return false, 0, err
++	}
++
++	// 1) 旧归档：逐帧复制，记录已归档的请求引用。旧归档损坏时放弃本会话（active 保持不动）。
++	have := map[string]bool{}
++	merged, err = s.copyOldArchive(dst, w, have)
++	if err != nil {
++		_ = enc.Close()
++		return false, 0, fmt.Errorf("existing archive unreadable, session left in active: %w", err)
++	}
++
++	// 2) active 中的请求，按时间顺序追加。
++	for _, f := range files {
++		if ctx.Err() != nil {
++			_ = enc.Close()
++			return false, 0, ctx.Err()
++		}
++		ref := rel + "/" + f.base
++		if have[ref] {
++			continue // 上次归档已写入（rename 后、删除 active 前中断），只需删除 active
++		}
++		if err := w.json(FrameEntry, EntryHeader{Ref: ref, CompressedSize: f.size, ModTime: f.mtime}); err != nil {
++			_ = enc.Close()
++			return false, 0, err
++		}
++		var werr error
++		info, rerr := s.walkActive(ref, func(fx frame) bool {
++			werr = w.frame(fx.typ, fx.kind, fx.seq, fx.payload)
++			return werr == nil
++		})
++		if werr != nil {
++			_ = enc.Close()
++			return false, 0, werr
++		}
++		end := EntryEnd{Status: info.Status}
++		if rerr != nil {
++			// 截断/损坏的请求文件：保留中断前的完整帧，并在条目尾记录状态。
++			end.Error = rerr.Error()
++			if errors.Is(rerr, errRequestNotFound) {
++				end.Status, end.Error = "missing", ""
++			}
++		}
++		if err := w.json(FrameEntryEnd, end); err != nil {
++			_ = enc.Close()
++			return false, 0, err
++		}
++	}
++
++	if err := enc.Close(); err != nil {
++		return false, 0, err
++	}
++	if err := bw.Flush(); err != nil {
++		return false, 0, err
++	}
++	if err := tmp.Sync(); err != nil {
++		return false, 0, err
++	}
++	st, err := tmp.Stat()
++	if err != nil {
++		return false, 0, err
++	}
++	if err := tmp.Close(); err != nil {
++		return false, 0, err
++	}
++	if err := os.Rename(tmpName, dst); err != nil {
++		return false, 0, err
++	}
++	ok = true
++	syncDir(filepath.Dir(dst))
++	return merged, st.Size(), nil
++}
++
++// copyOldArchive 把已有的会话归档逐帧复制到 w；返回是否存在旧归档。
++func (s *Store) copyOldArchive(dst string, w *sessionWriter, have map[string]bool) (bool, error) {
++	f, err := os.Open(dst) //nolint:gosec // 路径由已校验的引用派生
++	if errors.Is(err, fs.ErrNotExist) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	defer func() { _ = f.Close() }()
++	dec, err := newDecoder(f)
++	if err != nil {
++		return true, err
++	}
++	defer dec.Close()
++	fr, err := openFrames(dec, sessionMagic)
++	if err != nil {
++		return true, err
++	}
++	var buf []byte
++	for {
++		fx, err := fr.next(buf)
++		if errors.Is(err, io.EOF) {
++			return true, nil
++		}
++		if err != nil {
++			return true, err
++		}
++		buf = fx.payload[:0]
++		if fx.typ == FrameEntry {
++			var eh EntryHeader
++			if json.Unmarshal(fx.payload, &eh) == nil {
++				have[eh.Ref] = true
++			}
++		}
++		if err := w.frame(fx.typ, fx.kind, fx.seq, fx.payload); err != nil {
++			return true, err
++		}
++	}
++}
++
++func syncDir(dir string) {
++	if d, err := os.Open(dir); err == nil { //nolint:gosec // 路径由已校验的引用派生
++		_ = d.Sync()
++		_ = d.Close()
++	}
++}
 diff --git a/backend/internal/audit/config.go b/backend/internal/audit/config.go
 new file mode 100644
-index 000000000..68207f9ec
+index 00000000..68c957e2
 --- /dev/null
 +++ b/backend/internal/audit/config.go
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,205 @@
 +// Package audit 实现网关请求报文的全量归档：每个客户端请求采集
-+// 客户端请求、实际上游请求、上游响应、客户端响应四份 Header/Body，
-+// 以 zstd 整体压缩写入本地目录，并提供按需流式读取的管理接口。
++// 客户端请求、实际上游请求、上游响应、客户端响应四个阶段的 Header/Body。
++//
++// 存储分两层（见 format.go）：请求时只写 active 目录（每请求一个 zstd 文件，
++// 四个阶段共用压缩流）；夜间任务把不再活跃的会话合并为 archive 目录下的单个
++// 会话压缩文件（大窗口，跨请求去重）。读取时先查 active，再查 archive，
++// 全程流式解压，不落临时文件。
 +//
 +// 该包刻意不依赖 service / repository / middleware 等业务包，
 +// 业务侧只通过少量钩子（Gin 中间件、RoundTripper、WS Tap、OnUsage）接入，
@@ -760,8 +1339,24 @@ index 000000000..68207f9ec
 +type Config struct {
 +	// Enabled 为 false 时所有钩子直接透传，不产生任何文件。
 +	Enabled bool
-+	// RootDir 归档根目录，默认 ./data/audit。
++	// RootDir 归档根目录，默认 ./data/audit；ActiveDir / ArchiveDir 未配置时位于其下。
 +	RootDir string
++	// ActiveDir 新请求写入目录（建议高速盘），默认 {RootDir}/active。
++	// 会话映射（.sessions）与请求索引（.index）也存放在这里。
++	ActiveDir string
++	// ArchiveDir 会话归档目录（可为大容量慢盘），默认 {RootDir}/archive。
++	ArchiveDir string
++	// ArchiveAfter 会话最后一次写入超过该时长后，由夜间任务归档，默认 72h。
++	ArchiveAfter time.Duration
++	// ArchiveAt 每天执行归档的本地时间（HH:MM），默认 03:00；设为 "off" 关闭定时归档。
++	ArchiveAt string
++	// ArchiveEncoderLevel 会话归档的 zstd 级别，默认 better（夜间执行，偏重压缩率）。
++	ArchiveEncoderLevel string
++	// ArchiveWindowMB 会话归档的匹配窗口（MB），需覆盖相邻两次请求的距离，默认 32。
++	// 也是读取归档时的解压内存上限。
++	ArchiveWindowMB int
++	// ActiveWindowMB 单请求文件的匹配窗口（MB），需覆盖客户端请求体到上游请求体的距离，默认 4。
++	ActiveWindowMB int
 +	// SessionHeaders 按优先级查找会话 ID 的请求头。
 +	SessionHeaders []string
 +	// RedactHeaders 落盘前需要脱敏的鉴权类 Header（大小写不敏感）。
@@ -773,7 +1368,7 @@ index 000000000..68207f9ec
 +	// MemoryBufferBytes 单个文件在内存中累积到该大小前不启用流式压缩，
 +	// 结束时一次性压缩；超过后切换为后台流式压缩，避免大正文占用内存。
 +	MemoryBufferBytes int
-+	// EncoderLevel zstd 压缩级别：fastest / default / better / best。
++	// EncoderLevel active 文件的 zstd 压缩级别：fastest / default / better / best。
 +	EncoderLevel string
 +	// DisplayBodyLimit 管理接口单段正文的展示上限（字节），超出部分只能下载；
 +	// 仅影响展示，不影响存储。
@@ -816,17 +1411,22 @@ index 000000000..68207f9ec
 +// DefaultConfig 返回默认配置（默认开启，根目录 ./data/audit）。
 +func DefaultConfig() Config {
 +	return Config{
-+		Enabled:           true,
-+		RootDir:           "./data/audit",
-+		SessionHeaders:    append([]string(nil), DefaultSessionHeaders...),
-+		RedactHeaders:     append([]string(nil), DefaultRedactHeaders...),
-+		RedactQueryParams: append([]string(nil), DefaultRedactQueryParams...),
-+		SessionCacheSize:  10000,
-+		MemoryBufferBytes: 512 << 10,
-+		EncoderLevel:      "fastest",
-+		DisplayBodyLimit:  4 << 20,
-+		FinalizeTimeout:   30 * time.Second,
-+		FlushWorkers:      max(4, 2*runtime.GOMAXPROCS(0)),
++		Enabled:             true,
++		RootDir:             "./data/audit",
++		ArchiveAfter:        72 * time.Hour,
++		ArchiveAt:           "03:00",
++		ArchiveEncoderLevel: "better",
++		ArchiveWindowMB:     32,
++		ActiveWindowMB:      4,
++		SessionHeaders:      append([]string(nil), DefaultSessionHeaders...),
++		RedactHeaders:       append([]string(nil), DefaultRedactHeaders...),
++		RedactQueryParams:   append([]string(nil), DefaultRedactQueryParams...),
++		SessionCacheSize:    10000,
++		MemoryBufferBytes:   512 << 10,
++		EncoderLevel:        "default",
++		DisplayBodyLimit:    4 << 20,
++		FinalizeTimeout:     30 * time.Second,
++		FlushWorkers:        max(4, 2*runtime.GOMAXPROCS(0)),
 +	}
 +}
 +
@@ -840,6 +1440,27 @@ index 000000000..68207f9ec
 +	}
 +	if v := strings.TrimSpace(viper.GetString("audit.root_dir")); v != "" {
 +		cfg.RootDir = v
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.active_dir")); v != "" {
++		cfg.ActiveDir = v
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.archive_dir")); v != "" {
++		cfg.ArchiveDir = v
++	}
++	if v := viper.GetDuration("audit.archive_after"); v > 0 {
++		cfg.ArchiveAfter = v
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.archive_at")); v != "" {
++		cfg.ArchiveAt = v
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.archive_encoder_level")); v != "" {
++		cfg.ArchiveEncoderLevel = v
++	}
++	if v := viper.GetInt("audit.archive_window_mb"); v > 0 {
++		cfg.ArchiveWindowMB = v
++	}
++	if v := viper.GetInt("audit.active_window_mb"); v > 0 {
++		cfg.ActiveWindowMB = v
 +	}
 +	if v := viper.GetStringSlice("audit.session_headers"); len(v) > 0 {
 +		cfg.SessionHeaders = splitList(v)
@@ -898,10 +1519,10 @@ index 000000000..68207f9ec
 +}
 diff --git a/backend/internal/audit/file.go b/backend/internal/audit/file.go
 new file mode 100644
-index 000000000..62a1e2d99
+index 00000000..95e8c5b9
 --- /dev/null
 +++ b/backend/internal/audit/file.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,242 @@
 +package audit
 +
 +import (
@@ -923,24 +1544,50 @@ index 000000000..62a1e2d99
 +	opts    []zstd.EOption
 +}
 +
-+func newCodec(level string) (*codec, error) {
-+	lvl := zstd.SpeedFastest
++func encoderLevel(level string) zstd.EncoderLevel {
 +	switch level {
 +	case "default":
-+		lvl = zstd.SpeedDefault
++		return zstd.SpeedDefault
 +	case "better":
-+		lvl = zstd.SpeedBetterCompression
++		return zstd.SpeedBetterCompression
 +	case "best":
-+		lvl = zstd.SpeedBestCompression
++		return zstd.SpeedBestCompression
 +	}
-+	opts := []zstd.EOption{
-+		zstd.WithEncoderLevel(lvl),
++	return zstd.SpeedFastest
++}
++
++// encoderOptions 返回压缩选项。windowMB 为匹配窗口（MB，2 的幂向上取整），
++// 决定能回溯去重的最大距离，也决定解压内存（约 2 倍窗口）。
++//
++// lowMem：单请求文件（几 MB 以内、并发多）用低内存模式；会话归档（长流、单线程）
++// 关闭低内存模式——实测 32MB 窗口下低内存模式压缩慢约 40 倍（15MB/s 对 550MB/s）。
++func encoderOptions(level string, windowMB int, lowMem bool) []zstd.EOption {
++	return []zstd.EOption{
++		zstd.WithEncoderLevel(encoderLevel(level)),
 +		zstd.WithEncoderConcurrency(1),
-+		zstd.WithLowerEncoderMem(true),
-+		zstd.WithWindowSize(1 << 20),
++		zstd.WithLowerEncoderMem(lowMem),
++		zstd.WithWindowSize(windowBytes(windowMB)),
 +		zstd.WithEncoderCRC(true),
 +		zstd.WithZeroFrames(true),
 +	}
++}
++
++func windowBytes(mb int) int {
++	if mb <= 0 {
++		mb = 1
++	}
++	w := zstd.MinWindowSize
++	for w < mb<<20 && w < maxWindowBytes {
++		w <<= 1
++	}
++	return w
++}
++
++// maxWindowBytes 是允许的最大匹配窗口；读取端按此值限制解压内存。
++const maxWindowBytes = 128 << 20
++
++func newCodec(level string, windowMB int) (*codec, error) {
++	opts := encoderOptions(level, windowMB, true)
 +	all, err := zstd.NewWriter(nil, opts...)
 +	if err != nil {
 +		return nil, err
@@ -961,7 +1608,7 @@ index 000000000..62a1e2d99
 +	c.streams.Put(enc)
 +}
 +
-+// archiveFile 是单个 .zst 归档文件的写入端。
++// archiveFile 是单个请求的 .zst 文件写入端（四个阶段共用一条压缩流）。
 +//
 +// 写入路径只做内存追加（拷贝），不在业务 goroutine 上压缩，也不做任何文件系统操作：
 +//   - 原始内容不超过 threshold 时，关闭阶段一次性 EncodeAll；
@@ -986,13 +1633,13 @@ index 000000000..62a1e2d99
 +
 +func newArchiveFile(open func() (*os.File, error), c *codec, threshold int) *archiveFile {
 +	af := &archiveFile{codec: c, open: open, threshold: threshold}
-+	af.buf = append(make([]byte, 0, 4096), fileMagic...)
-+	af.raw = int64(len(fileMagic))
++	af.buf = append(make([]byte, 0, 4096), requestMagic...)
++	af.raw = int64(len(requestMagic))
 +	return af
 +}
 +
 +// writeFrame 追加一个帧；payload 超过 maxFramePayload 时自动拆分。
-+func (a *archiveFile) writeFrame(typ byte, seq uint16, payload []byte) error {
++func (a *archiveFile) writeFrame(typ, kind byte, seq uint16, payload []byte) error {
 +	a.mu.Lock()
 +	defer a.mu.Unlock()
 +	if a.closed {
@@ -1003,7 +1650,7 @@ index 000000000..62a1e2d99
 +		if n > maxFramePayload {
 +			n = maxFramePayload
 +		}
-+		a.appendLocked(typ, seq, payload[:n])
++		a.appendLocked(typ, kind, seq, payload[:n])
 +		payload = payload[n:]
 +		if len(payload) == 0 {
 +			return nil
@@ -1011,10 +1658,10 @@ index 000000000..62a1e2d99
 +	}
 +}
 +
-+func (a *archiveFile) appendLocked(typ byte, seq uint16, payload []byte) {
++func (a *archiveFile) appendLocked(typ, kind byte, seq uint16, payload []byte) {
 +	a.raw += int64(frameHeaderSize + len(payload))
 +	if !a.streaming {
-+		a.buf = encodeFrameHeader(a.buf, typ, seq, len(payload))
++		a.buf = encodeFrameHeader(a.buf, typ, kind, seq, len(payload))
 +		a.buf = append(a.buf, payload...)
 +		if len(a.buf) > a.threshold {
 +			a.startStreamLocked()
@@ -1022,7 +1669,7 @@ index 000000000..62a1e2d99
 +		return
 +	}
 +	chunk := make([]byte, 0, frameHeaderSize+len(payload))
-+	chunk = encodeFrameHeader(chunk, typ, seq, len(payload))
++	chunk = encodeFrameHeader(chunk, typ, kind, seq, len(payload))
 +	chunk = append(chunk, payload...)
 +	a.queue = append(a.queue, chunk)
 +	a.cond.Signal()
@@ -1120,10 +1767,10 @@ index 000000000..62a1e2d99
 +}
 diff --git a/backend/internal/audit/format.go b/backend/internal/audit/format.go
 new file mode 100644
-index 000000000..0568c9cf6
+index 00000000..40ff05f7
 --- /dev/null
 +++ b/backend/internal/audit/format.go
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,135 @@
 +package audit
 +
 +import (
@@ -1131,17 +1778,28 @@ index 000000000..0568c9cf6
 +	"time"
 +)
 +
-+// 归档文件 = 一个完整的 zstd 流；解压后的内容为：
++// 存储格式
 +//
-+//	Magic(8) | Frame*
-+//	Frame = Type(1) | Seq(uint16 BE) | Len(uint32 BE) | Payload(Len)
++// active（高速盘）：每个客户端请求一个文件 {active}/{yyyy-MM}/{dd}/{session}/{requestId}-{n}.zst，
++// 内容是一个完整的 zstd 流，四个阶段（客户端请求 / 上游请求 / 上游响应 / 客户端响应）
++// 共用这一条流压缩（客户端请求体与上游请求体高度相似，同流压缩可去重）：
 +//
-+// 一个文件内可以有多个 section（以 Seq 区分）：客户端两份文件只有 Seq=0，
-+// 上游两份文件中每个调度尝试（attempt）占一个 Seq（从 1 开始）。
-+// 正文以原始字节分块写入 FrameBody，不做任何改写或截断；
-+// section 以 FrameEnd 结束，缺失 FrameEnd 即视为不完整。
++//	RequestMagic(8) | Frame*
++//
++// archive（大容量盘）：每个会话一个文件 {archive}/{yyyy-MM}/{dd}/{session}.zst，
++// 由夜间任务把会话内全部请求按时间顺序写入同一条 zstd 流（大窗口，跨请求去重）：
++//
++//	SessionMagic(8) | ( FrameEntry | <该请求的 Frame*> | FrameEntryEnd )*
++//
++// Frame = Type(1) | Kind(1) | Seq(uint16 BE) | Len(uint32 BE) | Payload(Len)
++//
++// Kind 区分四个阶段；Seq 区分同一阶段内的多个 section：客户端两个阶段只有 Seq=0，
++// 上游两个阶段中每个调度尝试（attempt）占一个 Seq（从 1 开始）。
++// 正文以原始字节分块写入 FrameBody，不做任何改写或截断；section 以 FrameEnd 结束，
++// 缺失 FrameEnd 即视为不完整。
 +const (
-+	fileMagic = "S2AAUD01"
++	requestMagic = "S2AAUD02"
++	sessionMagic = "S2AARC01"
 +
 +	FrameHeader byte = 'H' // JSON SectionHeader
 +	FrameBody   byte = 'B' // 正文原始字节
@@ -1150,11 +1808,15 @@ index 000000000..0568c9cf6
 +	FrameMsg    byte = 'W' // WebSocket 消息：opcode(1) | unixnano(8) | data
 +	FrameNote   byte = 'N' // JSON 附注（连接复用、用量回调等）
 +
-+	frameHeaderSize = 7
++	// 仅出现在会话归档文件中：一个请求的起止。
++	FrameEntry    byte = 'Q' // JSON EntryHeader
++	FrameEntryEnd byte = 'Z' // JSON EntryEnd
++
++	frameHeaderSize = 8
 +	maxFramePayload = 1 << 20
 +)
 +
-+// 四份文件的类型。
++// 四个阶段。
 +const (
 +	KindClientRequest    = "client_request"
 +	KindUpstreamRequest  = "upstream_request"
@@ -1162,8 +1824,37 @@ index 000000000..0568c9cf6
 +	KindClientResponse   = "client_response"
 +)
 +
-+// Kinds 按展示顺序列出四份文件。
++// Kinds 按展示顺序列出四个阶段；下标即帧头中的 Kind 字节。
 +var Kinds = []string{KindClientRequest, KindUpstreamRequest, KindUpstreamResponse, KindClientResponse}
++
++// kindIndex 返回阶段的下标；未知阶段返回 -1。
++func kindIndex(kind string) int {
++	for i, k := range Kinds {
++		if k == kind {
++			return i
++		}
++	}
++	return -1
++}
++
++// ValidKind 判断阶段名是否合法。
++func ValidKind(kind string) bool { return kindIndex(kind) >= 0 }
++
++// EntryHeader 是会话归档中一个请求条目的头。
++type EntryHeader struct {
++	Ref string `json:"ref"`
++	// CompressedSize 为归档前 active 文件的压缩大小。
++	CompressedSize int64     `json:"compressed_size"`
++	ModTime        time.Time `json:"mtime"`
++}
++
++// EntryEnd 是会话归档中一个请求条目的尾。
++type EntryEnd struct {
++	// Status 为该请求在 active 中读取时的状态：ok / empty / truncated / corrupt / error。
++	// 非 ok 时条目内保留了读取中断之前的全部完整帧。
++	Status string `json:"status"`
++	Error  string `json:"error,omitempty"`
++}
 +
 +// SectionHeader 描述一段报文的起始信息（Header 已脱敏）。
 +type SectionHeader struct {
@@ -1198,11 +1889,12 @@ index 000000000..0568c9cf6
 +	Messages int64          `json:"messages,omitempty"`
 +}
 +
-+func encodeFrameHeader(dst []byte, typ byte, seq uint16, n int) []byte {
++func encodeFrameHeader(dst []byte, typ, kind byte, seq uint16, n int) []byte {
 +	var h [frameHeaderSize]byte
 +	h[0] = typ
-+	binary.BigEndian.PutUint16(h[1:3], seq)
-+	binary.BigEndian.PutUint32(h[3:7], uint32(n)) //nolint:gosec // n <= maxFramePayload
++	h[1] = kind
++	binary.BigEndian.PutUint16(h[2:4], seq)
++	binary.BigEndian.PutUint32(h[4:8], uint32(n)) //nolint:gosec // n <= maxFramePayload
 +	return append(dst, h[:]...)
 +}
 +
@@ -1216,10 +1908,10 @@ index 000000000..0568c9cf6
 +)
 diff --git a/backend/internal/audit/gin.go b/backend/internal/audit/gin.go
 new file mode 100644
-index 000000000..7ceabc8e1
+index 00000000..ee0cac06
 --- /dev/null
 +++ b/backend/internal/audit/gin.go
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,357 @@
 +package audit
 +
 +import (
@@ -1259,7 +1951,9 @@ index 000000000..7ceabc8e1
 +			slog.Error("audit_archive_init_failed", "error", err)
 +			return
 +		}
-+		slog.Info("audit_archive_enabled", "root", s.Root())
++		slog.Info("audit_archive_enabled", "active_dir", s.ActiveDir(), "archive_dir", s.ArchiveDir(),
++			"archive_at", cfg.ArchiveAt, "archive_after", cfg.ArchiveAfter)
++		s.Start()
 +		defaultStore.Store(s)
 +	})
 +	return defaultStore.Load()
@@ -1575,12 +2269,86 @@ index 000000000..7ceabc8e1
 +	}
 +	return n, err
 +}
+diff --git a/backend/internal/audit/locks.go b/backend/internal/audit/locks.go
+new file mode 100644
+index 00000000..cb33d97c
+--- /dev/null
++++ b/backend/internal/audit/locks.go
+@@ -0,0 +1,68 @@
++package audit
++
++import "sync"
++
++// sessionLocks 是按会话目录（相对路径）加锁的读写锁表。
++//
++// 写入方（请求落盘：创建文件 → 压缩写入 → 关闭）持读锁，同一会话的多个请求互不阻塞；
++// 夜间归档持写锁，并且只用 TryLock：会话正在写入即说明仍活跃，本轮直接跳过。
++// 条目按引用计数回收，表的大小只与“正在写入/归档的会话数”有关。
++type sessionLocks struct {
++	mu sync.Mutex
++	m  map[string]*sessionLock
++}
++
++type sessionLock struct {
++	rw   sync.RWMutex
++	refs int
++}
++
++func newSessionLocks() *sessionLocks {
++	return &sessionLocks{m: make(map[string]*sessionLock)}
++}
++
++func (l *sessionLocks) acquire(key string) *sessionLock {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	e := l.m[key]
++	if e == nil {
++		e = &sessionLock{}
++		l.m[key] = e
++	}
++	e.refs++
++	return e
++}
++
++func (l *sessionLocks) release(key string) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if e := l.m[key]; e != nil {
++		e.refs--
++		if e.refs <= 0 {
++			delete(l.m, key)
++		}
++	}
++}
++
++// RLock 获取会话的写入锁（共享），返回解锁函数。
++func (l *sessionLocks) RLock(key string) func() {
++	e := l.acquire(key)
++	e.rw.RLock()
++	return func() {
++		e.rw.RUnlock()
++		l.release(key)
++	}
++}
++
++// TryLock 尝试获取会话的归档锁（独占）；失败返回 nil。
++func (l *sessionLocks) TryLock(key string) func() {
++	e := l.acquire(key)
++	if !e.rw.TryLock() {
++		l.release(key)
++		return nil
++	}
++	return func() {
++		e.rw.Unlock()
++		l.release(key)
++	}
++}
 diff --git a/backend/internal/audit/reader.go b/backend/internal/audit/reader.go
 new file mode 100644
-index 000000000..abda348a7
+index 00000000..d16658b8
 --- /dev/null
 +++ b/backend/internal/audit/reader.go
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,437 @@
 +package audit
 +
 +import (
@@ -1596,8 +2364,6 @@ index 000000000..abda348a7
 +	"fmt"
 +	"hash"
 +	"io"
-+	"io/fs"
-+	"os"
 +	"strings"
 +	"time"
 +	"unicode/utf8"
@@ -1610,12 +2376,13 @@ index 000000000..abda348a7
 +// ErrNotArchive 表示文件不是本归档格式。
 +var ErrNotArchive = errors.New("audit: not an archive file")
 +
-+// newDecoder 在内存中流式解压，不产生临时文件。
++// newDecoder 在内存中流式解压，不产生临时文件；内存约为 2 倍压缩窗口。
++// 不用低内存模式：实测 32MB 窗口下低内存模式解压慢约 10 倍（~100MB/s 对 ~1.1GB/s）。
 +func newDecoder(r io.Reader) (*zstd.Decoder, error) {
 +	return zstd.NewReader(r,
 +		zstd.WithDecoderConcurrency(1),
-+		zstd.WithDecoderLowmem(true),
-+		zstd.WithDecoderMaxWindow(64<<20),
++		zstd.WithDecoderLowmem(false),
++		zstd.WithDecoderMaxWindow(maxWindowBytes),
 +	)
 +}
 +
@@ -1627,48 +2394,77 @@ index 000000000..abda348a7
 +
 +type frame struct {
 +	typ     byte
++	kind    byte
 +	seq     uint16
 +	payload []byte
 +}
 +
-+func openFrames(r io.Reader) (*frameReader, error) {
++// openFrames 校验魔数并返回帧读取器。
++func openFrames(r io.Reader, magic string) (*frameReader, error) {
 +	br := bufio.NewReaderSize(r, 64<<10)
-+	magic := make([]byte, len(fileMagic))
-+	if _, err := io.ReadFull(br, magic); err != nil {
++	got := make([]byte, len(magic))
++	if _, err := io.ReadFull(br, got); err != nil {
 +		if errors.Is(err, io.EOF) {
 +			return nil, io.EOF
 +		}
 +		return nil, err
 +	}
-+	if string(magic) != fileMagic {
++	if string(got) != magic {
 +		return nil, ErrNotArchive
 +	}
 +	return &frameReader{r: br}, nil
 +}
 +
-+// next 读取一帧；payload 复用 buf。返回 io.EOF 表示正常结束，io.ErrUnexpectedEOF 表示截断。
-+func (fr *frameReader) next(buf []byte) (frame, error) {
++// header 读取下一帧的帧头。返回 io.EOF 表示正常结束，io.ErrUnexpectedEOF 表示截断。
++func (fr *frameReader) header() (typ, kind byte, seq uint16, n int, err error) {
 +	if _, err := io.ReadFull(fr.r, fr.hdr[:]); err != nil {
 +		if errors.Is(err, io.EOF) {
-+			return frame{}, io.EOF
++			return 0, 0, 0, 0, io.EOF
 +		}
-+		return frame{}, io.ErrUnexpectedEOF
++		return 0, 0, 0, 0, io.ErrUnexpectedEOF
 +	}
-+	n := int(binary.BigEndian.Uint32(fr.hdr[3:7]))
++	n = int(binary.BigEndian.Uint32(fr.hdr[4:8]))
 +	if n > maxFramePayload+16 {
-+		return frame{}, fmt.Errorf("audit: frame too large (%d)", n)
++		return 0, 0, 0, 0, fmt.Errorf("audit: frame too large (%d)", n)
 +	}
++	return fr.hdr[0], fr.hdr[1], binary.BigEndian.Uint16(fr.hdr[2:4]), n, nil
++}
++
++// payload 读取当前帧的负载；复用 buf。
++func (fr *frameReader) payload(buf []byte, n int) ([]byte, error) {
 +	if cap(buf) < n {
 +		buf = make([]byte, n)
 +	}
 +	buf = buf[:n]
 +	if _, err := io.ReadFull(fr.r, buf); err != nil {
-+		return frame{}, io.ErrUnexpectedEOF
++		return nil, io.ErrUnexpectedEOF
 +	}
-+	return frame{typ: fr.hdr[0], seq: binary.BigEndian.Uint16(fr.hdr[1:3]), payload: buf}, nil
++	return buf, nil
 +}
 +
-+// FileView 是单个归档文件的展示视图。
++// skip 跳过当前帧的负载（仍需解压，但不复制）。
++func (fr *frameReader) skip(n int) error {
++	if _, err := fr.r.Discard(n); err != nil {
++		return io.ErrUnexpectedEOF
++	}
++	return nil
++}
++
++// next 读取一帧；payload 复用 buf。
++func (fr *frameReader) next(buf []byte) (frame, error) {
++	typ, kind, seq, n, err := fr.header()
++	if err != nil {
++		return frame{}, err
++	}
++	p, err := fr.payload(buf, n)
++	if err != nil {
++		return frame{}, err
++	}
++	return frame{typ: typ, kind: kind, seq: seq, payload: p}, nil
++}
++
++// FileView 是一个阶段（客户端请求 / 上游请求 / 上游响应 / 客户端响应）的展示视图。
++// 四个阶段存放在同一个压缩流中，压缩大小只在请求级别（ArchiveView.Storage）给出。
 +type FileView struct {
 +	Kind           string           `json:"kind"`
 +	Exists         bool             `json:"exists"`
@@ -1736,101 +2532,52 @@ index 000000000..abda348a7
 +	Error      string    `json:"error,omitempty"`
 +}
 +
-+// ReadFile 解析一个归档文件。displayLimit 限制每段保留用于展示的正文字节，
-+// 超出部分仍参与计数与哈希校验，可通过下载接口完整获取。
-+func ReadFile(path, kind string, displayLimit int) *FileView {
-+	fv := &FileView{Kind: kind, Sections: []*SectionView{}}
-+	st, err := os.Stat(path)
-+	if errors.Is(err, fs.ErrNotExist) {
-+		fv.Status = "missing"
-+		return fv
++// readViews 读取一个请求的四个阶段并构建展示视图。displayLimit 限制每段保留用于展示的
++// 正文字节，超出部分仍参与计数与哈希校验，可通过下载接口完整获取。
++func (s *Store) readViews(ref string, displayLimit int) ([]*FileView, StorageInfo) {
++	views := make([]*FileView, len(Kinds))
++	latest := make([]map[uint16]*SectionView, len(Kinds))
++	for i, k := range Kinds {
++		views[i] = &FileView{Kind: k, Exists: true, Status: "ok", Sections: []*SectionView{}}
++		latest[i] = map[uint16]*SectionView{}
 +	}
-+	if err != nil {
-+		fv.Status, fv.Error = "error", err.Error()
-+		return fv
-+	}
-+	fv.Exists = true
-+	fv.CompressedSize = st.Size()
-+	if st.Size() == 0 {
-+		// 文件已创建但尚未落盘：请求仍在进行，或进程在落盘前退出。
-+		fv.Status = "empty"
-+		return fv
-+	}
-+	f, err := os.Open(path) //nolint:gosec // 路径已由 FilePath 校验
-+	if err != nil {
-+		fv.Status, fv.Error = "error", err.Error()
-+		return fv
-+	}
-+	defer func() { _ = f.Close() }()
-+	dec, err := newDecoder(f)
-+	if err != nil {
-+		fv.Status, fv.Error = "corrupt", err.Error()
-+		return fv
-+	}
-+	defer dec.Close()
-+	counter := &countingReader{r: dec}
-+	fr, err := openFrames(counter)
-+	if err != nil {
-+		fv.Status, fv.Error = "corrupt", err.Error()
-+		return fv
-+	}
-+	latest := map[uint16]*SectionView{}
-+	var buf []byte
-+	fv.Status = "ok"
-+	for {
-+		fr2, err := fr.next(buf)
-+		if errors.Is(err, io.EOF) {
-+			break
++	info, _ := s.walkRequest(ref, func(f frame) bool {
++		if int(f.kind) >= len(views) {
++			return true
 +		}
-+		if err != nil {
-+			fv.Status, fv.Error = "truncated", err.Error()
-+			break
-+		}
-+		buf = fr2.payload[:0]
-+		switch fr2.typ {
++		fv := views[f.kind]
++		fv.RawSize += int64(frameHeaderSize + len(f.payload))
++		switch f.typ {
 +		case FrameHeader:
-+			sv := &SectionView{Index: len(fv.Sections), Seq: int(fr2.seq), hash: sha256.New(), xxh: xxhash.New(), limit: displayLimit}
-+			if err := json.Unmarshal(fr2.payload, &sv.Header); err != nil {
-+				sv.Header.Kind = kind
++			sv := &SectionView{Index: len(fv.Sections), Seq: int(f.seq), hash: sha256.New(), xxh: xxhash.New(), limit: displayLimit}
++			if err := json.Unmarshal(f.payload, &sv.Header); err != nil {
++				sv.Header.Kind = fv.Kind
 +			}
 +			fv.Sections = append(fv.Sections, sv)
-+			latest[fr2.seq] = sv
++			latest[f.kind][f.seq] = sv
 +		case FrameNote:
 +			var note map[string]any
-+			if json.Unmarshal(fr2.payload, &note) == nil {
++			if json.Unmarshal(f.payload, &note) == nil {
 +				fv.Notes = append(fv.Notes, note)
 +			}
 +		default:
-+			sv := latest[fr2.seq]
-+			if sv == nil {
-+				continue
++			if sv := latest[f.kind][f.seq]; sv != nil {
++				sv.consume(f)
 +			}
-+			sv.consume(fr2)
++		}
++		return true
++	})
++	for _, fv := range views {
++		if info.Status != "ok" {
++			// 四个阶段共用一条压缩流：流的状态即每个阶段的状态。
++			fv.Status, fv.Error = info.Status, info.Error
++			fv.Exists = info.Status != "missing"
++		}
++		for _, sv := range fv.Sections {
++			sv.finalize()
 +		}
 +	}
-+	fv.RawSize = counter.n
-+	if fv.Status == "ok" && counter.err != nil && !errors.Is(counter.err, io.EOF) {
-+		fv.Status, fv.Error = "truncated", counter.err.Error()
-+	}
-+	for _, sv := range fv.Sections {
-+		sv.finalize()
-+	}
-+	return fv
-+}
-+
-+type countingReader struct {
-+	r   io.Reader
-+	n   int64
-+	err error
-+}
-+
-+func (c *countingReader) Read(p []byte) (int, error) {
-+	n, err := c.r.Read(p)
-+	c.n += int64(n)
-+	if err != nil {
-+		c.err = err
-+	}
-+	return n, err
++	return views, info
 +}
 +
 +func (sv *SectionView) consume(f frame) {
@@ -2041,7 +2788,7 @@ index 000000000..abda348a7
 +}
 diff --git a/backend/internal/audit/recorder.go b/backend/internal/audit/recorder.go
 new file mode 100644
-index 000000000..e20dd3a5b
+index 00000000..6938b078
 --- /dev/null
 +++ b/backend/internal/audit/recorder.go
 @@ -0,0 +1,291 @@
@@ -2086,7 +2833,7 @@ index 000000000..e20dd3a5b
 +	return r
 +}
 +
-+// Recorder 是单个客户端请求的归档器（四个文件）。
++// Recorder 是单个客户端请求的归档器（四个阶段写入同一个文件）。
 +type Recorder struct {
 +	store         *Store
 +	ID            string
@@ -2097,7 +2844,7 @@ index 000000000..e20dd3a5b
 +	SpanID        string
 +	Started       time.Time
 +
-+	files    [4]*archiveFile
++	file     *archiveFile
 +	attempts atomic.Int32
 +	finished atomic.Bool
 +
@@ -2107,9 +2854,17 @@ index 000000000..e20dd3a5b
 +	ref    string
 +	usage  []IndexEntry // 结束前收到的用量回调，落盘时写入索引
 +
-+	filesOnce sync.Once
-+	filesRes  [4]*os.File
-+	filesErr  error
++	fileOnce sync.Once
++	fileRes  *os.File
++	fileErr  error
++	unlock   func() // 会话写入锁，文件关闭后释放
++}
++
++func (r *Recorder) releaseLock() {
++	if r.unlock != nil {
++		r.unlock()
++		r.unlock = nil
++	}
 +}
 +
 +// ArchiveRef 返回归档位置（相对根目录）；文件尚未创建时为空。
@@ -2117,15 +2872,6 @@ index 000000000..e20dd3a5b
 +	r.mu.Lock()
 +	defer r.mu.Unlock()
 +	return r.ref
-+}
-+
-+func (r *Recorder) file(kind string) *archiveFile {
-+	for i, k := range Kinds {
-+		if k == kind {
-+			return r.files[i]
-+		}
-+	}
-+	return nil
 +}
 +
 +// NextAttempt 分配一个上游调度尝试序号（从 1 开始）。
@@ -2140,6 +2886,7 @@ index 000000000..e20dd3a5b
 +type section struct {
 +	rec      *Recorder
 +	file     *archiveFile
++	kind     byte
 +	seq      uint16
 +	mu       sync.Mutex
 +	h        *xxhash.Digest
@@ -2153,10 +2900,11 @@ index 000000000..e20dd3a5b
 +	if r == nil || r.finished.Load() {
 +		return nil
 +	}
-+	f := r.file(kind)
-+	if f == nil {
++	ki := kindIndex(kind)
++	if ki < 0 {
 +		return nil
 +	}
++	f := r.file
 +	hdr.Kind = kind
 +	if hdr.Time.IsZero() {
 +		hdr.Time = time.Now()
@@ -2166,11 +2914,11 @@ index 000000000..e20dd3a5b
 +		return nil
 +	}
 +	seq := uint16(hdr.Seq) //nolint:gosec // attempts are bounded far below 65535
-+	if err := f.writeFrame(FrameHeader, seq, payload); err != nil {
++	if err := f.writeFrame(FrameHeader, byte(ki), seq, payload); err != nil {
 +		r.store.stats.DroppedWrites.Add(1)
 +		return nil
 +	}
-+	s := &section{rec: r, file: f, seq: seq, h: xxhash.New()}
++	s := &section{rec: r, file: f, kind: byte(ki), seq: seq, h: xxhash.New()}
 +	r.mu.Lock()
 +	r.open[s] = struct{}{}
 +	r.mu.Unlock()
@@ -2186,7 +2934,7 @@ index 000000000..e20dd3a5b
 +	if s.ended {
 +		return
 +	}
-+	if err := s.file.writeFrame(FrameBody, s.seq, p); err != nil {
++	if err := s.file.writeFrame(FrameBody, s.kind, s.seq, p); err != nil {
 +		s.rec.store.stats.DroppedWrites.Add(1)
 +		return
 +	}
@@ -2204,7 +2952,7 @@ index 000000000..e20dd3a5b
 +	if s.ended {
 +		return
 +	}
-+	if err := s.file.writeFrame(FrameRaw, s.seq, p); err != nil {
++	if err := s.file.writeFrame(FrameRaw, s.kind, s.seq, p); err != nil {
 +		s.rec.store.stats.DroppedWrites.Add(1)
 +		return
 +	}
@@ -2225,7 +2973,7 @@ index 000000000..e20dd3a5b
 +	buf[0] = op
 +	binary.BigEndian.PutUint64(buf[1:9], uint64(time.Now().UnixNano())) //nolint:gosec // 时间戳为正
 +	copy(buf[9:], data)
-+	if err := s.file.writeFrame(FrameMsg, s.seq, buf); err != nil {
++	if err := s.file.writeFrame(FrameMsg, s.kind, s.seq, buf); err != nil {
 +		s.rec.store.stats.DroppedWrites.Add(1)
 +		return
 +	}
@@ -2253,7 +3001,7 @@ index 000000000..e20dd3a5b
 +		Messages: s.messages,
 +	}
 +	payload, _ := json.Marshal(e)
-+	if err := s.file.writeFrame(FrameEnd, s.seq, payload); err != nil {
++	if err := s.file.writeFrame(FrameEnd, s.kind, s.seq, payload); err != nil {
 +		s.rec.store.stats.DroppedWrites.Add(1)
 +	}
 +	s.mu.Unlock()
@@ -2268,8 +3016,8 @@ index 000000000..e20dd3a5b
 +	if r == nil || r.finished.Load() {
 +		return
 +	}
-+	f := r.file(kind)
-+	if f == nil {
++	ki := kindIndex(kind)
++	if ki < 0 {
 +		return
 +	}
 +	note = maps.Clone(note)
@@ -2281,7 +3029,7 @@ index 000000000..e20dd3a5b
 +	if err != nil {
 +		return
 +	}
-+	if f.writeFrame(FrameNote, uint16(seq), payload) != nil { //nolint:gosec // bounded
++	if r.file.writeFrame(FrameNote, byte(ki), uint16(seq), payload) != nil { //nolint:gosec // bounded
 +		r.store.stats.DroppedWrites.Add(1)
 +	}
 +}
@@ -2315,21 +3063,20 @@ index 000000000..e20dd3a5b
 +		r.store.flushSem <- struct{}{}
 +		r.store.stats.FlushBacklog.Add(-1)
 +		defer func() { <-r.store.flushSem }()
-+		if _, err := r.ensureFiles(); err == nil {
++		if _, err := r.ensureFile(); err == nil {
 +			ref := r.ArchiveRef()
 +			for _, e := range usage {
 +				e.Ref = ref
 +				r.store.writeUsageIndex(e)
 +			}
 +		}
-+		var raw int64
-+		for _, f := range r.files {
-+			raw += f.rawSize()
-+			if err := f.close(); err != nil {
-+				r.store.stats.CloseErrors.Add(1)
-+				slog.Warn("audit_archive_close_failed", "request_id", r.ID, "error", err)
-+			}
++		raw := r.file.rawSize()
++		if err := r.file.close(); err != nil {
++			r.store.stats.CloseErrors.Add(1)
++			slog.Warn("audit_archive_close_failed", "request_id", r.ID, "error", err)
 +		}
++		// 文件已完整落盘（或创建失败），释放会话写入锁，夜间归档方可处理该会话。
++		r.releaseLock()
 +		r.store.stats.RawBytes.Add(raw)
 +	}()
 +}
@@ -2338,7 +3085,7 @@ index 000000000..e20dd3a5b
 +func (r *Recorder) Finished() bool { return r == nil || r.finished.Load() }
 diff --git a/backend/internal/audit/redact.go b/backend/internal/audit/redact.go
 new file mode 100644
-index 000000000..d19410882
+index 00000000..d1941088
 --- /dev/null
 +++ b/backend/internal/audit/redact.go
 @@ -0,0 +1,128 @@
@@ -2472,7 +3219,7 @@ index 000000000..d19410882
 +}
 diff --git a/backend/internal/audit/session.go b/backend/internal/audit/session.go
 new file mode 100644
-index 000000000..c737b5f60
+index 00000000..c737b5f6
 --- /dev/null
 +++ b/backend/internal/audit/session.go
 @@ -0,0 +1,179 @@
@@ -2655,12 +3402,265 @@ index 000000000..c737b5f60
 +	}
 +	return dir, nil
 +}
+diff --git a/backend/internal/audit/source.go b/backend/internal/audit/source.go
+new file mode 100644
+index 00000000..c210c96b
+--- /dev/null
++++ b/backend/internal/audit/source.go
+@@ -0,0 +1,247 @@
++package audit
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++// 存储位置。
++const (
++	LocationActive  = "active"
++	LocationArchive = "archive"
++	LocationMissing = "missing"
++)
++
++// errRequestNotFound 表示 active 与 archive 中都没有该请求。
++var errRequestNotFound = errors.New("audit: request not found")
++
++// StorageInfo 描述一个请求当前的存储位置与读取状态。
++type StorageInfo struct {
++	// Location: active / archive / missing
++	Location string `json:"location"`
++	// Status: ok / empty / truncated / corrupt / error / missing
++	Status string `json:"status"`
++	Error  string `json:"error,omitempty"`
++	// CompressedSize：active 为该请求文件的大小；archive 为归档前 active 文件的大小。
++	CompressedSize int64 `json:"compressed_size"`
++	// SessionCompressedSize：archive 中整个会话文件的大小（会话内所有请求共用）。
++	SessionCompressedSize int64 `json:"session_compressed_size,omitempty"`
++	// RawSize：该请求解压后的帧字节数。
++	RawSize int64 `json:"raw_size"`
++}
++
++// walkRequest 按 active → archive 的顺序定位请求，并依次把该请求的帧交给 fn
++// （fn 返回 false 提前结束）。全程流式解压，内存只占解压窗口；
++// 在 archive 中只解压到目标请求为止，其余请求的负载被跳过而不复制。
++//
++// 返回的 error 仅表示“读取中断”（截断、损坏、I/O 错误），info.Status 同步记录；
++// 请求不存在时返回 errRequestNotFound。
++func (s *Store) walkRequest(ref string, fn func(f frame) bool) (StorageInfo, error) {
++	if !ValidRef(ref) {
++		return StorageInfo{Location: LocationMissing, Status: "missing"}, errors.New("audit: invalid archive ref")
++	}
++	info, err := s.walkActive(ref, fn)
++	if !errors.Is(err, errRequestNotFound) {
++		return info, err
++	}
++	return s.walkArchive(ref, fn)
++}
++
++func (s *Store) walkActive(ref string, fn func(f frame) bool) (StorageInfo, error) {
++	info := StorageInfo{Location: LocationActive, Status: "ok"}
++	f, err := os.Open(s.activeRequestPath(ref)) //nolint:gosec // 路径由已校验的引用派生
++	if errors.Is(err, fs.ErrNotExist) {
++		return StorageInfo{Location: LocationMissing, Status: "missing"}, errRequestNotFound
++	}
++	if err != nil {
++		return info.fail("error", err)
++	}
++	defer func() { _ = f.Close() }()
++	if st, err := f.Stat(); err == nil {
++		info.CompressedSize = st.Size()
++		if st.Size() == 0 {
++			// 文件已创建但尚未落盘：请求仍在进行，或进程在落盘前退出。
++			info.Status = "empty"
++			return info, nil
++		}
++	}
++	dec, err := newDecoder(f)
++	if err != nil {
++		return info.fail("corrupt", err)
++	}
++	defer dec.Close()
++	fr, err := openFrames(dec, requestMagic)
++	if err != nil {
++		return info.fail("corrupt", err)
++	}
++	info.RawSize = int64(len(requestMagic))
++	var buf []byte
++	for {
++		fx, err := fr.next(buf)
++		if errors.Is(err, io.EOF) {
++			return info, nil
++		}
++		if err != nil {
++			return info.fail("truncated", err)
++		}
++		buf = fx.payload[:0]
++		info.RawSize += int64(frameHeaderSize + len(fx.payload))
++		if !fn(fx) {
++			return info, nil
++		}
++	}
++}
++
++// archiveReadSlots 限制同时解压会话归档的数量（每个约占 2 倍归档窗口的内存）。
++const archiveReadSlots = 4
++
++func (s *Store) walkArchive(ref string, fn func(f frame) bool) (StorageInfo, error) {
++	missing := StorageInfo{Location: LocationMissing, Status: "missing"}
++	s.archiveReads <- struct{}{}
++	defer func() { <-s.archiveReads }()
++	f, err := os.Open(s.archiveSessionPath(refSessionDir(ref))) //nolint:gosec // 路径由已校验的引用派生
++	if errors.Is(err, fs.ErrNotExist) {
++		return missing, errRequestNotFound
++	}
++	info := StorageInfo{Location: LocationArchive, Status: "ok"}
++	if err != nil {
++		return info.fail("error", err)
++	}
++	defer func() { _ = f.Close() }()
++	if st, err := f.Stat(); err == nil {
++		info.SessionCompressedSize = st.Size()
++	}
++	dec, err := newDecoder(f)
++	if err != nil {
++		return info.fail("corrupt", err)
++	}
++	defer dec.Close()
++	fr, err := openFrames(dec, sessionMagic)
++	if err != nil {
++		return info.fail("corrupt", err)
++	}
++	found := false
++	var buf []byte
++	for {
++		typ, kind, seq, n, err := fr.header()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			if found {
++				return info.fail("truncated", err)
++			}
++			return info.fail("corrupt", err)
++		}
++		switch {
++		case typ == FrameEntry:
++			if found {
++				return info, nil // 下一个条目开始：目标条目结束
++			}
++			p, err := fr.payload(buf, n)
++			if err != nil {
++				return info.fail("corrupt", err)
++			}
++			buf = p[:0]
++			var eh EntryHeader
++			if json.Unmarshal(p, &eh) == nil && eh.Ref == ref {
++				found = true
++				info.CompressedSize = eh.CompressedSize
++				info.RawSize = int64(len(requestMagic))
++			}
++		case typ == FrameEntryEnd:
++			if !found {
++				if err := fr.skip(n); err != nil {
++					return info.fail("corrupt", err)
++				}
++				continue
++			}
++			p, err := fr.payload(buf, n)
++			if err != nil {
++				return info.fail("truncated", err)
++			}
++			var ee EntryEnd
++			if json.Unmarshal(p, &ee) == nil && ee.Status != "" && ee.Status != "ok" {
++				info.Status, info.Error = ee.Status, ee.Error
++			}
++			return info, nil
++		case found:
++			p, err := fr.payload(buf, n)
++			if err != nil {
++				return info.fail("truncated", err)
++			}
++			buf = p[:0]
++			info.RawSize += int64(frameHeaderSize + n)
++			if !fn(frame{typ: typ, kind: kind, seq: seq, payload: p}) {
++				return info, nil
++			}
++		default:
++			if err := fr.skip(n); err != nil {
++				return info.fail("corrupt", err)
++			}
++		}
++	}
++	if !found {
++		return missing, errRequestNotFound
++	}
++	// 条目没有结束帧（归档文件被截断）。
++	return info.fail("truncated", io.ErrUnexpectedEOF)
++}
++
++func (i StorageInfo) fail(status string, err error) (StorageInfo, error) {
++	if i.Status == "ok" || i.Status == "" {
++		i.Status = status
++	}
++	i.Error = err.Error()
++	return i, err
++}
++
++// WriteRequestBundle 把一个请求的全部阶段作为单个 zstd 流写出（与 active 文件格式相同：
++// RequestMagic | Frame*），四个阶段共用一次压缩，适合整体下载传输。
++// 请求在 active 中时直接复制文件字节，不重新压缩；在 archive 中时只解压该请求并重新压缩。
++func (s *Store) WriteRequestBundle(w io.Writer, ref string) (StorageInfo, error) {
++	if !ValidRef(ref) {
++		return StorageInfo{Location: LocationMissing, Status: "missing"}, errors.New("audit: invalid archive ref")
++	}
++	if f, err := os.Open(s.activeRequestPath(ref)); err == nil { //nolint:gosec // 路径由已校验的引用派生
++		defer func() { _ = f.Close() }()
++		n, err := io.Copy(w, f)
++		return StorageInfo{Location: LocationActive, Status: "ok", CompressedSize: n}, err
++	} else if !errors.Is(err, fs.ErrNotExist) {
++		return StorageInfo{Location: LocationActive, Status: "error", Error: err.Error()}, err
++	}
++	enc, err := zstd.NewWriter(w, encoderOptions(s.cfg.EncoderLevel, s.cfg.ActiveWindowMB, true)...)
++	if err != nil {
++		return StorageInfo{}, err
++	}
++	if _, err := enc.Write([]byte(requestMagic)); err != nil {
++		_ = enc.Close()
++		return StorageInfo{}, err
++	}
++	var werr error
++	hdr := make([]byte, 0, frameHeaderSize)
++	info, err := s.walkArchive(ref, func(f frame) bool {
++		hdr = encodeFrameHeader(hdr[:0], f.typ, f.kind, f.seq, len(f.payload))
++		if _, werr = enc.Write(hdr); werr == nil {
++			_, werr = enc.Write(f.payload)
++		}
++		return werr == nil
++	})
++	cerr := enc.Close()
++	if werr != nil {
++		return info, werr
++	}
++	if err != nil {
++		return info, err
++	}
++	if cerr != nil {
++		return info, fmt.Errorf("audit: bundle encode: %w", cerr)
++	}
++	return info, nil
++}
 diff --git a/backend/internal/audit/store.go b/backend/internal/audit/store.go
 new file mode 100644
-index 000000000..304be7c7c
+index 00000000..0a0f04a2
 --- /dev/null
 +++ b/backend/internal/audit/store.go
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,340 @@
 +package audit
 +
 +import (
@@ -2672,6 +3672,7 @@ index 000000000..304be7c7c
 +	"io/fs"
 +	"log/slog"
 +	"os"
++	"path"
 +	"path/filepath"
 +	"regexp"
 +	"strings"
@@ -2680,17 +3681,24 @@ index 000000000..304be7c7c
 +	"time"
 +)
 +
-+// Store 管理归档根目录、会话目录映射、请求索引与压缩器。
++// Store 是请求报文日志的存取组件：写入（active）、查询（active → archive）、
++// 夜间归档（active → archive）都经由它完成，业务侧只通过钩子接入。
 +type Store struct {
-+	cfg      Config
-+	root     string
-+	red      *redactor
-+	sessions *sessionDirs
-+	codec    *codec
-+	pending  sync.WaitGroup
-+	flushSem chan struct{}
-+	closed   atomic.Bool
-+	now      func() time.Time
++	cfg        Config
++	activeDir  string
++	archiveDir string
++	red        *redactor
++	sessions   *sessionDirs
++	locks      *sessionLocks
++	codec      *codec
++	pending    sync.WaitGroup
++	flushSem   chan struct{}
++	// archiveReads 限制同时解压会话归档的数量。
++	archiveReads chan struct{}
++	closed       atomic.Bool
++	now          func() time.Time
++
++	archiver *archiver
 +
 +	// 统计（用于性能报告与健康检查）
 +	stats Stats
@@ -2706,44 +3714,83 @@ index 000000000..304be7c7c
 +	FlushBacklog  atomic.Int64
 +}
 +
-+// NewStore 创建归档存储；根目录不存在时自动创建。
++// NewStore 创建存取组件；目录不存在时自动创建。定时归档需调用 Start 启动。
 +func NewStore(cfg Config) (*Store, error) {
++	def := DefaultConfig()
 +	if strings.TrimSpace(cfg.RootDir) == "" {
-+		cfg.RootDir = DefaultConfig().RootDir
++		cfg.RootDir = def.RootDir
 +	}
-+	root, err := filepath.Abs(cfg.RootDir)
++	if strings.TrimSpace(cfg.ActiveDir) == "" {
++		cfg.ActiveDir = filepath.Join(cfg.RootDir, "active")
++	}
++	if strings.TrimSpace(cfg.ArchiveDir) == "" {
++		cfg.ArchiveDir = filepath.Join(cfg.RootDir, "archive")
++	}
++	active, err := filepath.Abs(cfg.ActiveDir)
 +	if err != nil {
 +		return nil, err
 +	}
-+	if err := os.MkdirAll(root, 0o750); err != nil {
-+		return nil, fmt.Errorf("audit: create root dir: %w", err)
++	archive, err := filepath.Abs(cfg.ArchiveDir)
++	if err != nil {
++		return nil, err
 +	}
-+	c, err := newCodec(cfg.EncoderLevel)
++	if active == archive || strings.HasPrefix(archive, active+string(filepath.Separator)) || strings.HasPrefix(active, archive+string(filepath.Separator)) {
++		return nil, fmt.Errorf("audit: active_dir and archive_dir must not overlap")
++	}
++	for _, d := range []string{active, archive} {
++		if err := os.MkdirAll(d, 0o750); err != nil {
++			return nil, fmt.Errorf("audit: create dir %s: %w", d, err)
++		}
++	}
++	if cfg.ActiveWindowMB <= 0 {
++		cfg.ActiveWindowMB = def.ActiveWindowMB
++	}
++	if cfg.ArchiveWindowMB <= 0 {
++		cfg.ArchiveWindowMB = def.ArchiveWindowMB
++	}
++	if cfg.ArchiveAfter <= 0 {
++		cfg.ArchiveAfter = def.ArchiveAfter
++	}
++	if strings.TrimSpace(cfg.ArchiveEncoderLevel) == "" {
++		cfg.ArchiveEncoderLevel = def.ArchiveEncoderLevel
++	}
++	c, err := newCodec(cfg.EncoderLevel, cfg.ActiveWindowMB)
 +	if err != nil {
 +		return nil, err
 +	}
 +	if cfg.MemoryBufferBytes <= 0 {
-+		cfg.MemoryBufferBytes = DefaultConfig().MemoryBufferBytes
++		cfg.MemoryBufferBytes = def.MemoryBufferBytes
 +	}
 +	if len(cfg.SessionHeaders) == 0 {
 +		cfg.SessionHeaders = DefaultSessionHeaders
 +	}
 +	if cfg.FlushWorkers <= 0 {
-+		cfg.FlushWorkers = DefaultConfig().FlushWorkers
++		cfg.FlushWorkers = def.FlushWorkers
 +	}
-+	return &Store{
-+		cfg:      cfg,
-+		root:     root,
-+		red:      newRedactor(cfg),
-+		sessions: newSessionDirs(root, cfg.SessionCacheSize),
-+		codec:    c,
-+		flushSem: make(chan struct{}, cfg.FlushWorkers),
-+		now:      time.Now,
-+	}, nil
++	s := &Store{
++		cfg:          cfg,
++		activeDir:    active,
++		archiveDir:   archive,
++		red:          newRedactor(cfg),
++		sessions:     newSessionDirs(active, cfg.SessionCacheSize),
++		locks:        newSessionLocks(),
++		codec:        c,
++		flushSem:     make(chan struct{}, cfg.FlushWorkers),
++		archiveReads: make(chan struct{}, archiveReadSlots),
++		now:          time.Now,
++	}
++	s.archiver = newArchiver(s)
++	return s, nil
 +}
 +
-+// Root 返回归档根目录的绝对路径。
-+func (s *Store) Root() string { return s.root }
++// Root 返回 active 目录的绝对路径（新请求写入位置）。
++func (s *Store) Root() string { return s.activeDir }
++
++// ActiveDir 返回 active 目录的绝对路径。
++func (s *Store) ActiveDir() string { return s.activeDir }
++
++// ArchiveDir 返回 archive 目录的绝对路径。
++func (s *Store) ArchiveDir() string { return s.archiveDir }
 +
 +// Config 返回生效配置。
 +func (s *Store) Config() Config { return s.cfg }
@@ -2761,12 +3808,13 @@ index 000000000..304be7c7c
 +	}
 +}
 +
-+// Close 停止接收新归档并等待已结束请求的压缩落盘完成。
++// Close 停止接收新归档、停止定时归档，并等待已结束请求的压缩落盘完成。
 +func (s *Store) Close(ctx context.Context) error {
 +	if s == nil {
 +		return nil
 +	}
 +	s.closed.Store(true)
++	s.archiver.stop()
 +	done := make(chan struct{})
 +	go func() {
 +		s.pending.Wait()
@@ -2782,35 +3830,30 @@ index 000000000..304be7c7c
 +
 +var refRE = regexp.MustCompile(`^\d{4}-\d{2}/\d{2}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}-\d{1,6}$`)
 +
-+// ValidRef 校验归档引用（相对根目录的基础路径，不含 kind 后缀）。
++// ValidRef 校验归档引用：{yyyy-MM}/{dd}/{session}/{requestId}-{n}。
 +func ValidRef(ref string) bool {
 +	return refRE.MatchString(ref) && !strings.Contains(ref, "..")
 +}
 +
-+// FilePath 返回某个归档引用下指定 kind 的文件绝对路径。
-+func (s *Store) FilePath(ref, kind string) (string, error) {
-+	if !ValidRef(ref) {
-+		return "", fmt.Errorf("audit: invalid archive ref")
-+	}
-+	valid := false
-+	for _, k := range Kinds {
-+		valid = valid || k == kind
-+	}
-+	if !valid {
-+		return "", fmt.Errorf("audit: invalid kind")
-+	}
-+	p := filepath.Join(s.root, filepath.FromSlash(ref)+"-"+kind+".zst")
-+	if !strings.HasPrefix(p, s.root+string(filepath.Separator)) {
-+		return "", fmt.Errorf("audit: invalid archive ref")
-+	}
-+	return p, nil
++// refSessionDir 返回引用所属的会话目录（{yyyy-MM}/{dd}/{session}）。
++func refSessionDir(ref string) string { return path.Dir(ref) }
++
++// activeRequestPath 返回请求在 active 中的文件路径。
++func (s *Store) activeRequestPath(ref string) string {
++	return filepath.Join(s.activeDir, filepath.FromSlash(ref)+".zst")
++}
++
++// archiveSessionPath 返回会话在 archive 中的文件路径。
++func (s *Store) archiveSessionPath(sessDir string) string {
++	return filepath.Join(s.archiveDir, filepath.FromSlash(sessDir)+".zst")
 +}
 +
 +// Begin 为一个客户端请求创建归档器。
 +//
 +// 请求热路径上只解析会话目录（有界 LRU 命中为纯内存；未命中时读/建一次标记文件，
-+// 保证“最先开始的请求”固定会话日期）；目录与四个文件的创建、索引追加全部推迟到后台
++// 保证“最先开始的请求”固定会话日期）；目录与文件的创建、索引追加全部推迟到后台
 +// （请求结束后的落盘 goroutine，或大正文切换流式压缩时）。
++// 会话即使已被归档，新请求也照常写入 active 中同一相对路径，由夜间任务合并。
 +func (s *Store) Begin(requestID, session, sessionHeader string, now time.Time) (*Recorder, error) {
 +	if s.closed.Load() {
 +		return nil, errors.New("audit: store closed")
@@ -2828,71 +3871,62 @@ index 000000000..304be7c7c
 +		Started:       now,
 +		open:          make(map[*section]struct{}),
 +	}
-+	for i := range Kinds {
-+		idx := i
-+		rec.files[i] = newArchiveFile(func() (*os.File, error) {
-+			files, err := rec.ensureFiles()
-+			if err != nil {
-+				return nil, err
-+			}
-+			return files[idx], nil
-+		}, s.codec, s.cfg.MemoryBufferBytes)
-+	}
++	rec.file = newArchiveFile(rec.ensureFile, s.codec, s.cfg.MemoryBufferBytes)
 +	s.pending.Add(1)
 +	s.stats.Requests.Add(1)
 +	return rec, nil
 +}
 +
-+// ensureFiles 只执行一次：定位会话目录（固定首次日期），以 O_EXCL 创建四个文件
-+// （{yyyy-MM}/{dd}/{session}/{requestId}-{n}-{kind}.zst，n 递增，重复请求 ID 不覆盖），
-+// 并追加请求索引。
-+func (r *Recorder) ensureFiles() ([4]*os.File, error) {
-+	r.filesOnce.Do(func() {
-+		r.filesRes, r.filesErr = r.store.createFiles(r)
-+		if r.filesErr != nil {
++// ensureFile 只执行一次：获取会话写入锁，以 O_EXCL 创建
++// {active}/{yyyy-MM}/{dd}/{session}/{requestId}-{n}.zst（n 递增；重复请求 ID 不覆盖，
++// 也不与已归档的同名请求冲突），并追加请求索引。
++func (r *Recorder) ensureFile() (*os.File, error) {
++	r.fileOnce.Do(func() {
++		r.unlock = r.store.locks.RLock(r.sessDir)
++		r.fileRes, r.fileErr = r.store.createFile(r)
++		if r.fileErr != nil {
++			r.releaseLock()
 +			r.store.stats.BeginErrors.Add(1)
-+			slog.Warn("audit_archive_create_failed", "request_id", r.ID, "error", r.filesErr)
++			slog.Warn("audit_archive_create_failed", "request_id", r.ID, "error", r.fileErr)
 +		}
 +	})
-+	return r.filesRes, r.filesErr
++	return r.fileRes, r.fileErr
 +}
 +
-+func (s *Store) createFiles(r *Recorder) ([4]*os.File, error) {
-+	var files [4]*os.File
++func (s *Store) createFile(r *Recorder) (*os.File, error) {
 +	sessDir := r.sessDir
-+	absDir := filepath.Join(s.root, filepath.FromSlash(sessDir))
++	absDir := filepath.Join(s.activeDir, filepath.FromSlash(sessDir))
 +	if err := os.MkdirAll(absDir, 0o750); err != nil {
-+		return files, err
++		return nil, err
++	}
++	// 已归档的同名引用（会话重激活后出现重复请求 ID）由索引给出，O(1) 读取。
++	taken := map[string]bool{}
++	if entries, err := s.Lookup(r.ID); err == nil {
++		for _, e := range entries {
++			taken[e.Ref] = true
++		}
 +	}
 +	name := safeName(r.ID)
 +	for n := 1; n <= 999999; n++ {
 +		base := fmt.Sprintf("%s-%d", name, n)
-+		f, err := os.OpenFile(filepath.Join(absDir, base+"-"+KindClientRequest+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
++		ref := sessDir + "/" + base
++		if taken[ref] {
++			continue
++		}
++		f, err := os.OpenFile(filepath.Join(absDir, base+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
 +		if errors.Is(err, fs.ErrExist) {
 +			continue
 +		}
 +		if err != nil {
-+			return files, err
++			return nil, err
 +		}
-+		files[0] = f
-+		for i, kind := range Kinds[1:] {
-+			f, err := os.OpenFile(filepath.Join(absDir, base+"-"+kind+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
-+			if err != nil {
-+				for _, opened := range files[:i+1] {
-+					_ = opened.Close()
-+				}
-+				return [4]*os.File{}, err
-+			}
-+			files[i+1] = f
-+		}
-+		ref := sessDir + "/" + base
 +		r.mu.Lock()
 +		r.ref = ref
 +		r.mu.Unlock()
 +		s.appendIndex(r.ID, IndexEntry{Ref: ref, Time: r.Started, Via: "client_request_id", RequestID: r.ID, Session: r.Session})
-+		return files, nil
++		return f, nil
 +	}
-+	return files, errors.New("audit: too many duplicate request ids")
++	return nil, errors.New("audit: too many duplicate request ids")
 +}
 +
 +// IndexEntry 是请求索引中的一行。索引按 ID 的 sha256 分桶，查找为 O(1) 文件读取。
@@ -2912,7 +3946,7 @@ index 000000000..304be7c7c
 +
 +func (s *Store) indexPath(key string) string {
 +	h := hashKey(key)
-+	return filepath.Join(s.root, ".index", h[:2], h[2:4], h+".idx")
++	return filepath.Join(s.activeDir, ".index", h[:2], h[2:4], h+".idx")
 +}
 +
 +func (s *Store) appendIndex(key string, e IndexEntry) {
@@ -2969,7 +4003,7 @@ index 000000000..304be7c7c
 +}
 diff --git a/backend/internal/audit/trace.go b/backend/internal/audit/trace.go
 new file mode 100644
-index 000000000..105115229
+index 00000000..10511522
 --- /dev/null
 +++ b/backend/internal/audit/trace.go
 @@ -0,0 +1,41 @@
@@ -3016,7 +4050,7 @@ index 000000000..105115229
 +}
 diff --git a/backend/internal/audit/transport.go b/backend/internal/audit/transport.go
 new file mode 100644
-index 000000000..648447c90
+index 00000000..648447c9
 --- /dev/null
 +++ b/backend/internal/audit/transport.go
 @@ -0,0 +1,297 @@
@@ -3319,7 +4353,7 @@ index 000000000..648447c90
 +}
 diff --git a/backend/internal/audit/usage.go b/backend/internal/audit/usage.go
 new file mode 100644
-index 000000000..4cb008733
+index 00000000..b669d76e
 --- /dev/null
 +++ b/backend/internal/audit/usage.go
 @@ -0,0 +1,91 @@
@@ -3391,7 +4425,7 @@ index 000000000..4cb008733
 +		rec.store.pending.Add(1)
 +		go func() {
 +			defer rec.store.pending.Done()
-+			if _, err := rec.ensureFiles(); err == nil {
++			if _, err := rec.ensureFile(); err == nil {
 +				entry.Ref = rec.ArchiveRef()
 +				rec.store.writeUsageIndex(entry)
 +			}
@@ -3416,7 +4450,7 @@ index 000000000..4cb008733
 +}
 diff --git a/backend/internal/audit/ws.go b/backend/internal/audit/ws.go
 new file mode 100644
-index 000000000..96d241b66
+index 00000000..96d241b6
 --- /dev/null
 +++ b/backend/internal/audit/ws.go
 @@ -0,0 +1,112 @@
@@ -3534,7 +4568,7 @@ index 000000000..96d241b66
 +}
 diff --git a/backend/internal/audit/wsraw.go b/backend/internal/audit/wsraw.go
 new file mode 100644
-index 000000000..f75577ac6
+index 00000000..f75577ac
 --- /dev/null
 +++ b/backend/internal/audit/wsraw.go
 @@ -0,0 +1,184 @@
@@ -3724,7 +4758,7 @@ index 000000000..f75577ac6
 +}
 diff --git a/backend/internal/handler/admin/usage_audit_archive.go b/backend/internal/handler/admin/usage_audit_archive.go
 new file mode 100644
-index 000000000..ce23276f7
+index 00000000..ce23276f
 --- /dev/null
 +++ b/backend/internal/handler/admin/usage_audit_archive.go
 @@ -0,0 +1,36 @@
@@ -3765,7 +4799,7 @@ index 000000000..ce23276f7
 +	}
 +}
 diff --git a/backend/internal/repository/http_upstream.go b/backend/internal/repository/http_upstream.go
-index ff19b03d8..15ee572f1 100644
+index ff19b03d..15ee572f 100644
 --- a/backend/internal/repository/http_upstream.go
 +++ b/backend/internal/repository/http_upstream.go
 @@ -26,6 +26,7 @@ import (
@@ -3794,7 +4828,7 @@ index ff19b03d8..15ee572f1 100644
  	if err != nil {
 diff --git a/backend/internal/repository/usage_log_audit_hook.go b/backend/internal/repository/usage_log_audit_hook.go
 new file mode 100644
-index 000000000..d6d6723b7
+index 00000000..d6d6723b
 --- /dev/null
 +++ b/backend/internal/repository/usage_log_audit_hook.go
 @@ -0,0 +1,26 @@
@@ -3825,7 +4859,7 @@ index 000000000..d6d6723b7
 +	})
 +}
 diff --git a/backend/internal/repository/usage_log_repo_insert.go b/backend/internal/repository/usage_log_repo_insert.go
-index e004433f3..fe9914ee8 100644
+index e004433f..fe9914ee 100644
 --- a/backend/internal/repository/usage_log_repo_insert.go
 +++ b/backend/internal/repository/usage_log_repo_insert.go
 @@ -150,10 +150,11 @@ const (
@@ -3856,7 +4890,7 @@ index e004433f3..fe9914ee8 100644
  	if tx := dbent.TxFromContext(ctx); tx != nil {
  		_, err := r.createSingle(ctx, tx.Client(), log)
 diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
-index 315fc20e4..9ad827b08 100644
+index 315fc20e..9ad827b0 100644
 --- a/backend/internal/server/routes/admin.go
 +++ b/backend/internal/server/routes/admin.go
 @@ -94,6 +94,9 @@ func RegisterAdminRoutes(
@@ -3871,7 +4905,7 @@ index 315fc20e4..9ad827b08 100644
  
 diff --git a/backend/internal/server/routes/audit_archive.go b/backend/internal/server/routes/audit_archive.go
 new file mode 100644
-index 000000000..278e7a5b8
+index 00000000..278e7a5b
 --- /dev/null
 +++ b/backend/internal/server/routes/audit_archive.go
 @@ -0,0 +1,46 @@
@@ -3922,7 +4956,7 @@ index 000000000..278e7a5b8
 +	audit.RegisterRoutes(admin, lookup)
 +}
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 3f09ebf40..3c96ecf80 100644
+index 3f09ebf4..3c96ecf8 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -32,7 +32,7 @@ func RegisterGatewayRoutes(
@@ -3935,7 +4969,7 @@ index 3f09ebf40..3c96ecf80 100644
  	endpointNorm := handler.InboundEndpointMiddleware()
  	compositeTarget := compositeTargetPlatformMiddleware(compositeResolver)
 diff --git a/backend/internal/service/openai_ws_client.go b/backend/internal/service/openai_ws_client.go
-index 7444e41d0..33f6ed315 100644
+index 7444e41d..33f6ed31 100644
 --- a/backend/internal/service/openai_ws_client.go
 +++ b/backend/internal/service/openai_ws_client.go
 @@ -1,7 +1,9 @@
@@ -4056,14 +5090,14 @@ index 7444e41d0..33f6ed315 100644
  }
 diff --git a/frontend-audit/.gitignore b/frontend-audit/.gitignore
 new file mode 100644
-index 000000000..3c3629e64
+index 00000000..3c3629e6
 --- /dev/null
 +++ b/frontend-audit/.gitignore
 @@ -0,0 +1 @@
 +node_modules
 diff --git a/frontend-audit/build.sh b/frontend-audit/build.sh
 new file mode 100755
-index 000000000..35239455d
+index 00000000..35239455
 --- /dev/null
 +++ b/frontend-audit/build.sh
 @@ -0,0 +1,31 @@
@@ -4100,7 +5134,7 @@ index 000000000..35239455d
 +echo "audit-ui build OK -> $dist"
 diff --git a/frontend-audit/deps/alias.mjs b/frontend-audit/deps/alias.mjs
 new file mode 100644
-index 000000000..4ca7ec32b
+index 00000000..4ca7ec32
 --- /dev/null
 +++ b/frontend-audit/deps/alias.mjs
 @@ -0,0 +1,14 @@
@@ -4120,7 +5154,7 @@ index 000000000..4ca7ec32b
 +}
 diff --git a/frontend-audit/deps/package.json b/frontend-audit/deps/package.json
 new file mode 100644
-index 000000000..01f4d95f1
+index 00000000..01f4d95f
 --- /dev/null
 +++ b/frontend-audit/deps/package.json
 @@ -0,0 +1,8 @@
@@ -4134,7 +5168,7 @@ index 000000000..01f4d95f1
 +}
 diff --git a/frontend-audit/deps/pnpm-lock.yaml b/frontend-audit/deps/pnpm-lock.yaml
 new file mode 100644
-index 000000000..a5285bebf
+index 00000000..a5285beb
 --- /dev/null
 +++ b/frontend-audit/deps/pnpm-lock.yaml
 @@ -0,0 +1,45 @@
@@ -4185,7 +5219,7 @@ index 000000000..a5285bebf
 +      marked: 14.0.0
 diff --git a/frontend-audit/plugin/usageTablePatch.mjs b/frontend-audit/plugin/usageTablePatch.mjs
 new file mode 100644
-index 000000000..fef53b07a
+index 00000000..fef53b07
 --- /dev/null
 +++ b/frontend-audit/plugin/usageTablePatch.mjs
 @@ -0,0 +1,59 @@
@@ -4250,7 +5284,7 @@ index 000000000..fef53b07a
 +}
 diff --git a/frontend-audit/src/AuditArchiveEntry.vue b/frontend-audit/src/AuditArchiveEntry.vue
 new file mode 100644
-index 000000000..ed7001be7
+index 00000000..ed7001be
 --- /dev/null
 +++ b/frontend-audit/src/AuditArchiveEntry.vue
 @@ -0,0 +1,64 @@
@@ -4320,10 +5354,10 @@ index 000000000..ed7001be7
 +</style>
 diff --git a/frontend-audit/src/AuditArchiveModal.vue b/frontend-audit/src/AuditArchiveModal.vue
 new file mode 100644
-index 000000000..7f23ca981
+index 00000000..e6847b2f
 --- /dev/null
 +++ b/frontend-audit/src/AuditArchiveModal.vue
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,475 @@
 +<template>
 +  <Teleport to="body">
 +    <div class="aa-overlay" data-testid="audit-archive-modal" @click.self="emit('close')">
@@ -4446,7 +5480,14 @@ index 000000000..7f23ca981
 +              <section v-if="activeFile" class="aa-file" :data-testid="`audit-file-${activeFile.kind}`">
 +                <div class="aa-row aa-muted">
 +                  <span class="aa-badge" :class="activeFile.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[activeFile.status] }}</span>
-+                  <span>zstd {{ formatBytes(activeFile.compressed_size) }} → {{ formatBytes(activeFile.raw_size) }}</span>
++                  <span>{{ formatBytes(activeFile.raw_size) }}</span>
++                  <span v-if="data.archive.storage" data-testid="audit-storage">
++                    {{ text.storage[data.archive.storage.location] }} ·
++                    {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
++                    <template v-if="data.archive.storage.session_compressed_size">
++                      · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
++                    </template>
++                  </span>
 +                  <span v-if="activeFile.error">{{ activeFile.error }}</span>
 +                </div>
 +                <div v-if="!activeFile.sections.length" class="aa-state">{{ text.noSections }}</div>
@@ -4794,7 +5835,7 @@ index 000000000..7f23ca981
 +</style>
 diff --git a/frontend-audit/src/AuditBodyView.vue b/frontend-audit/src/AuditBodyView.vue
 new file mode 100644
-index 000000000..d981bb3a8
+index 00000000..d981bb3a
 --- /dev/null
 +++ b/frontend-audit/src/AuditBodyView.vue
 @@ -0,0 +1,216 @@
@@ -5016,7 +6057,7 @@ index 000000000..d981bb3a8
 +</style>
 diff --git a/frontend-audit/src/AuditSectionPanel.vue b/frontend-audit/src/AuditSectionPanel.vue
 new file mode 100644
-index 000000000..58204a4df
+index 00000000..58204a4d
 --- /dev/null
 +++ b/frontend-audit/src/AuditSectionPanel.vue
 @@ -0,0 +1,311 @@
@@ -5333,10 +6374,10 @@ index 000000000..58204a4df
 +</style>
 diff --git a/frontend-audit/src/api.ts b/frontend-audit/src/api.ts
 new file mode 100644
-index 000000000..eb0507cf8
+index 00000000..3d912e75
 --- /dev/null
 +++ b/frontend-audit/src/api.ts
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,218 @@
 +import { apiClient } from '@/api/client'
 +
 +export type ArchiveKind = 'client_request' | 'upstream_request' | 'upstream_response' | 'client_response'
@@ -5438,8 +6479,18 @@ index 000000000..eb0507cf8
 +  response_sections: number[]
 +}
 +
++export interface StorageInfo {
++  location: 'active' | 'archive' | 'missing'
++  status: string
++  error?: string
++  compressed_size: number
++  session_compressed_size?: number
++  raw_size: number
++}
++
 +export interface ArchiveView {
 +  ref: string
++  storage?: StorageInfo
 +  files: FileView[]
 +  summary: Record<string, any>
 +  attempts: AttemptView[]
@@ -5547,10 +6598,10 @@ index 000000000..eb0507cf8
 +}
 diff --git a/frontend-audit/src/i18n.ts b/frontend-audit/src/i18n.ts
 new file mode 100644
-index 000000000..e75758451
+index 00000000..2d4824ee
 --- /dev/null
 +++ b/frontend-audit/src/i18n.ts
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,206 @@
 +import { computed } from 'vue'
 +import { useI18n } from 'vue-i18n'
 +
@@ -5606,6 +6657,13 @@ index 000000000..e75758451
 +    corrupt: '文件损坏',
 +    error: '读取错误'
 +  } as Record<string, string>,
++  storage: {
++    active: 'active（逐请求压缩）',
++    archive: 'archive（会话整体压缩）',
++    missing: '缺失'
++  } as Record<string, string>,
++  requestSize: '本请求',
++  sessionSize: '会话文件',
 +  noSections: '无内容',
 +  headers: '请求头 / 响应头',
 +  body: '正文',
@@ -5694,6 +6752,13 @@ index 000000000..e75758451
 +    corrupt: 'File corrupt',
 +    error: 'Read error'
 +  },
++  storage: {
++    active: 'active (per request)',
++    archive: 'archive (whole session)',
++    missing: 'missing'
++  },
++  requestSize: 'request',
++  sessionSize: 'session file',
 +  noSections: 'No content',
 +  headers: 'Headers',
 +  body: 'Body',
@@ -5745,7 +6810,7 @@ index 000000000..e75758451
 +}
 diff --git a/frontend-audit/src/monaco.ts b/frontend-audit/src/monaco.ts
 new file mode 100644
-index 000000000..996e974ed
+index 00000000..996e974e
 --- /dev/null
 +++ b/frontend-audit/src/monaco.ts
 @@ -0,0 +1,16 @@
@@ -5767,7 +6832,7 @@ index 000000000..996e974ed
 +export { monaco }
 diff --git a/frontend-audit/tools/verify-patch.mjs b/frontend-audit/tools/verify-patch.mjs
 new file mode 100644
-index 000000000..9e4308cff
+index 00000000..9e4308cf
 --- /dev/null
 +++ b/frontend-audit/tools/verify-patch.mjs
 @@ -0,0 +1,24 @@
@@ -5797,7 +6862,7 @@ index 000000000..9e4308cff
 +if (failed) process.exit(1)
 diff --git a/frontend-audit/tsconfig.json b/frontend-audit/tsconfig.json
 new file mode 100644
-index 000000000..51f753a55
+index 00000000..51f753a5
 --- /dev/null
 +++ b/frontend-audit/tsconfig.json
 @@ -0,0 +1,14 @@
@@ -5817,7 +6882,7 @@ index 000000000..51f753a55
 +}
 diff --git a/frontend-audit/vite.config.mts b/frontend-audit/vite.config.mts
 new file mode 100644
-index 000000000..d051c9c0b
+index 00000000..d051c9c0
 --- /dev/null
 +++ b/frontend-audit/vite.config.mts
 @@ -0,0 +1,37 @@

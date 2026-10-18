@@ -66,7 +66,7 @@ func OnUsage(ctx context.Context, ev UsageEvent) {
 		rec.store.pending.Add(1)
 		go func() {
 			defer rec.store.pending.Done()
-			if _, err := rec.ensureFiles(); err == nil {
+			if _, err := rec.ensureFile(); err == nil {
 				entry.Ref = rec.ArchiveRef()
 				rec.store.writeUsageIndex(entry)
 			}

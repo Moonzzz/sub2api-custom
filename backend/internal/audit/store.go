@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -17,17 +18,24 @@ import (
 	"time"
 )
 
-// Store 管理归档根目录、会话目录映射、请求索引与压缩器。
+// Store 是请求报文日志的存取组件：写入（active）、查询（active → archive）、
+// 夜间归档（active → archive）都经由它完成，业务侧只通过钩子接入。
 type Store struct {
-	cfg      Config
-	root     string
-	red      *redactor
-	sessions *sessionDirs
-	codec    *codec
-	pending  sync.WaitGroup
-	flushSem chan struct{}
-	closed   atomic.Bool
-	now      func() time.Time
+	cfg        Config
+	activeDir  string
+	archiveDir string
+	red        *redactor
+	sessions   *sessionDirs
+	locks      *sessionLocks
+	codec      *codec
+	pending    sync.WaitGroup
+	flushSem   chan struct{}
+	// archiveReads 限制同时解压会话归档的数量。
+	archiveReads chan struct{}
+	closed       atomic.Bool
+	now          func() time.Time
+
+	archiver *archiver
 
 	// 统计（用于性能报告与健康检查）
 	stats Stats
@@ -43,44 +51,83 @@ type Stats struct {
 	FlushBacklog  atomic.Int64
 }
 
-// NewStore 创建归档存储；根目录不存在时自动创建。
+// NewStore 创建存取组件；目录不存在时自动创建。定时归档需调用 Start 启动。
 func NewStore(cfg Config) (*Store, error) {
+	def := DefaultConfig()
 	if strings.TrimSpace(cfg.RootDir) == "" {
-		cfg.RootDir = DefaultConfig().RootDir
+		cfg.RootDir = def.RootDir
 	}
-	root, err := filepath.Abs(cfg.RootDir)
+	if strings.TrimSpace(cfg.ActiveDir) == "" {
+		cfg.ActiveDir = filepath.Join(cfg.RootDir, "active")
+	}
+	if strings.TrimSpace(cfg.ArchiveDir) == "" {
+		cfg.ArchiveDir = filepath.Join(cfg.RootDir, "archive")
+	}
+	active, err := filepath.Abs(cfg.ActiveDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(root, 0o750); err != nil {
-		return nil, fmt.Errorf("audit: create root dir: %w", err)
+	archive, err := filepath.Abs(cfg.ArchiveDir)
+	if err != nil {
+		return nil, err
 	}
-	c, err := newCodec(cfg.EncoderLevel)
+	if active == archive || strings.HasPrefix(archive, active+string(filepath.Separator)) || strings.HasPrefix(active, archive+string(filepath.Separator)) {
+		return nil, fmt.Errorf("audit: active_dir and archive_dir must not overlap")
+	}
+	for _, d := range []string{active, archive} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return nil, fmt.Errorf("audit: create dir %s: %w", d, err)
+		}
+	}
+	if cfg.ActiveWindowMB <= 0 {
+		cfg.ActiveWindowMB = def.ActiveWindowMB
+	}
+	if cfg.ArchiveWindowMB <= 0 {
+		cfg.ArchiveWindowMB = def.ArchiveWindowMB
+	}
+	if cfg.ArchiveAfter <= 0 {
+		cfg.ArchiveAfter = def.ArchiveAfter
+	}
+	if strings.TrimSpace(cfg.ArchiveEncoderLevel) == "" {
+		cfg.ArchiveEncoderLevel = def.ArchiveEncoderLevel
+	}
+	c, err := newCodec(cfg.EncoderLevel, cfg.ActiveWindowMB)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.MemoryBufferBytes <= 0 {
-		cfg.MemoryBufferBytes = DefaultConfig().MemoryBufferBytes
+		cfg.MemoryBufferBytes = def.MemoryBufferBytes
 	}
 	if len(cfg.SessionHeaders) == 0 {
 		cfg.SessionHeaders = DefaultSessionHeaders
 	}
 	if cfg.FlushWorkers <= 0 {
-		cfg.FlushWorkers = DefaultConfig().FlushWorkers
+		cfg.FlushWorkers = def.FlushWorkers
 	}
-	return &Store{
-		cfg:      cfg,
-		root:     root,
-		red:      newRedactor(cfg),
-		sessions: newSessionDirs(root, cfg.SessionCacheSize),
-		codec:    c,
-		flushSem: make(chan struct{}, cfg.FlushWorkers),
-		now:      time.Now,
-	}, nil
+	s := &Store{
+		cfg:          cfg,
+		activeDir:    active,
+		archiveDir:   archive,
+		red:          newRedactor(cfg),
+		sessions:     newSessionDirs(active, cfg.SessionCacheSize),
+		locks:        newSessionLocks(),
+		codec:        c,
+		flushSem:     make(chan struct{}, cfg.FlushWorkers),
+		archiveReads: make(chan struct{}, archiveReadSlots),
+		now:          time.Now,
+	}
+	s.archiver = newArchiver(s)
+	return s, nil
 }
 
-// Root 返回归档根目录的绝对路径。
-func (s *Store) Root() string { return s.root }
+// Root 返回 active 目录的绝对路径（新请求写入位置）。
+func (s *Store) Root() string { return s.activeDir }
+
+// ActiveDir 返回 active 目录的绝对路径。
+func (s *Store) ActiveDir() string { return s.activeDir }
+
+// ArchiveDir 返回 archive 目录的绝对路径。
+func (s *Store) ArchiveDir() string { return s.archiveDir }
 
 // Config 返回生效配置。
 func (s *Store) Config() Config { return s.cfg }
@@ -98,12 +145,13 @@ func (s *Store) StatsSnapshot() map[string]int64 {
 	}
 }
 
-// Close 停止接收新归档并等待已结束请求的压缩落盘完成。
+// Close 停止接收新归档、停止定时归档，并等待已结束请求的压缩落盘完成。
 func (s *Store) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
 	s.closed.Store(true)
+	s.archiver.stop()
 	done := make(chan struct{})
 	go func() {
 		s.pending.Wait()
@@ -119,35 +167,30 @@ func (s *Store) Close(ctx context.Context) error {
 
 var refRE = regexp.MustCompile(`^\d{4}-\d{2}/\d{2}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}-\d{1,6}$`)
 
-// ValidRef 校验归档引用（相对根目录的基础路径，不含 kind 后缀）。
+// ValidRef 校验归档引用：{yyyy-MM}/{dd}/{session}/{requestId}-{n}。
 func ValidRef(ref string) bool {
 	return refRE.MatchString(ref) && !strings.Contains(ref, "..")
 }
 
-// FilePath 返回某个归档引用下指定 kind 的文件绝对路径。
-func (s *Store) FilePath(ref, kind string) (string, error) {
-	if !ValidRef(ref) {
-		return "", fmt.Errorf("audit: invalid archive ref")
-	}
-	valid := false
-	for _, k := range Kinds {
-		valid = valid || k == kind
-	}
-	if !valid {
-		return "", fmt.Errorf("audit: invalid kind")
-	}
-	p := filepath.Join(s.root, filepath.FromSlash(ref)+"-"+kind+".zst")
-	if !strings.HasPrefix(p, s.root+string(filepath.Separator)) {
-		return "", fmt.Errorf("audit: invalid archive ref")
-	}
-	return p, nil
+// refSessionDir 返回引用所属的会话目录（{yyyy-MM}/{dd}/{session}）。
+func refSessionDir(ref string) string { return path.Dir(ref) }
+
+// activeRequestPath 返回请求在 active 中的文件路径。
+func (s *Store) activeRequestPath(ref string) string {
+	return filepath.Join(s.activeDir, filepath.FromSlash(ref)+".zst")
+}
+
+// archiveSessionPath 返回会话在 archive 中的文件路径。
+func (s *Store) archiveSessionPath(sessDir string) string {
+	return filepath.Join(s.archiveDir, filepath.FromSlash(sessDir)+".zst")
 }
 
 // Begin 为一个客户端请求创建归档器。
 //
 // 请求热路径上只解析会话目录（有界 LRU 命中为纯内存；未命中时读/建一次标记文件，
-// 保证“最先开始的请求”固定会话日期）；目录与四个文件的创建、索引追加全部推迟到后台
+// 保证“最先开始的请求”固定会话日期）；目录与文件的创建、索引追加全部推迟到后台
 // （请求结束后的落盘 goroutine，或大正文切换流式压缩时）。
+// 会话即使已被归档，新请求也照常写入 active 中同一相对路径，由夜间任务合并。
 func (s *Store) Begin(requestID, session, sessionHeader string, now time.Time) (*Recorder, error) {
 	if s.closed.Load() {
 		return nil, errors.New("audit: store closed")
@@ -165,71 +208,62 @@ func (s *Store) Begin(requestID, session, sessionHeader string, now time.Time) (
 		Started:       now,
 		open:          make(map[*section]struct{}),
 	}
-	for i := range Kinds {
-		idx := i
-		rec.files[i] = newArchiveFile(func() (*os.File, error) {
-			files, err := rec.ensureFiles()
-			if err != nil {
-				return nil, err
-			}
-			return files[idx], nil
-		}, s.codec, s.cfg.MemoryBufferBytes)
-	}
+	rec.file = newArchiveFile(rec.ensureFile, s.codec, s.cfg.MemoryBufferBytes)
 	s.pending.Add(1)
 	s.stats.Requests.Add(1)
 	return rec, nil
 }
 
-// ensureFiles 只执行一次：定位会话目录（固定首次日期），以 O_EXCL 创建四个文件
-// （{yyyy-MM}/{dd}/{session}/{requestId}-{n}-{kind}.zst，n 递增，重复请求 ID 不覆盖），
-// 并追加请求索引。
-func (r *Recorder) ensureFiles() ([4]*os.File, error) {
-	r.filesOnce.Do(func() {
-		r.filesRes, r.filesErr = r.store.createFiles(r)
-		if r.filesErr != nil {
+// ensureFile 只执行一次：获取会话写入锁，以 O_EXCL 创建
+// {active}/{yyyy-MM}/{dd}/{session}/{requestId}-{n}.zst（n 递增；重复请求 ID 不覆盖，
+// 也不与已归档的同名请求冲突），并追加请求索引。
+func (r *Recorder) ensureFile() (*os.File, error) {
+	r.fileOnce.Do(func() {
+		r.unlock = r.store.locks.RLock(r.sessDir)
+		r.fileRes, r.fileErr = r.store.createFile(r)
+		if r.fileErr != nil {
+			r.releaseLock()
 			r.store.stats.BeginErrors.Add(1)
-			slog.Warn("audit_archive_create_failed", "request_id", r.ID, "error", r.filesErr)
+			slog.Warn("audit_archive_create_failed", "request_id", r.ID, "error", r.fileErr)
 		}
 	})
-	return r.filesRes, r.filesErr
+	return r.fileRes, r.fileErr
 }
 
-func (s *Store) createFiles(r *Recorder) ([4]*os.File, error) {
-	var files [4]*os.File
+func (s *Store) createFile(r *Recorder) (*os.File, error) {
 	sessDir := r.sessDir
-	absDir := filepath.Join(s.root, filepath.FromSlash(sessDir))
+	absDir := filepath.Join(s.activeDir, filepath.FromSlash(sessDir))
 	if err := os.MkdirAll(absDir, 0o750); err != nil {
-		return files, err
+		return nil, err
+	}
+	// 已归档的同名引用（会话重激活后出现重复请求 ID）由索引给出，O(1) 读取。
+	taken := map[string]bool{}
+	if entries, err := s.Lookup(r.ID); err == nil {
+		for _, e := range entries {
+			taken[e.Ref] = true
+		}
 	}
 	name := safeName(r.ID)
 	for n := 1; n <= 999999; n++ {
 		base := fmt.Sprintf("%s-%d", name, n)
-		f, err := os.OpenFile(filepath.Join(absDir, base+"-"+KindClientRequest+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+		ref := sessDir + "/" + base
+		if taken[ref] {
+			continue
+		}
+		f, err := os.OpenFile(filepath.Join(absDir, base+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
 		if errors.Is(err, fs.ErrExist) {
 			continue
 		}
 		if err != nil {
-			return files, err
+			return nil, err
 		}
-		files[0] = f
-		for i, kind := range Kinds[1:] {
-			f, err := os.OpenFile(filepath.Join(absDir, base+"-"+kind+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
-			if err != nil {
-				for _, opened := range files[:i+1] {
-					_ = opened.Close()
-				}
-				return [4]*os.File{}, err
-			}
-			files[i+1] = f
-		}
-		ref := sessDir + "/" + base
 		r.mu.Lock()
 		r.ref = ref
 		r.mu.Unlock()
 		s.appendIndex(r.ID, IndexEntry{Ref: ref, Time: r.Started, Via: "client_request_id", RequestID: r.ID, Session: r.Session})
-		return files, nil
+		return f, nil
 	}
-	return files, errors.New("audit: too many duplicate request ids")
+	return nil, errors.New("audit: too many duplicate request ids")
 }
 
 // IndexEntry 是请求索引中的一行。索引按 ID 的 sha256 分桶，查找为 O(1) 文件读取。
@@ -249,7 +283,7 @@ type IndexEntry struct {
 
 func (s *Store) indexPath(key string) string {
 	h := hashKey(key)
-	return filepath.Join(s.root, ".index", h[:2], h[2:4], h+".idx")
+	return filepath.Join(s.activeDir, ".index", h[:2], h[2:4], h+".idx")
 }
 
 func (s *Store) appendIndex(key string, e IndexEntry) {

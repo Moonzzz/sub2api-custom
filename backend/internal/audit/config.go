@@ -1,6 +1,10 @@
 // Package audit 实现网关请求报文的全量归档：每个客户端请求采集
-// 客户端请求、实际上游请求、上游响应、客户端响应四份 Header/Body，
-// 以 zstd 整体压缩写入本地目录，并提供按需流式读取的管理接口。
+// 客户端请求、实际上游请求、上游响应、客户端响应四个阶段的 Header/Body。
+//
+// 存储分两层（见 format.go）：请求时只写 active 目录（每请求一个 zstd 文件，
+// 四个阶段共用压缩流）；夜间任务把不再活跃的会话合并为 archive 目录下的单个
+// 会话压缩文件（大窗口，跨请求去重）。读取时先查 active，再查 archive，
+// 全程流式解压，不落临时文件。
 //
 // 该包刻意不依赖 service / repository / middleware 等业务包，
 // 业务侧只通过少量钩子（Gin 中间件、RoundTripper、WS Tap、OnUsage）接入，
@@ -21,8 +25,24 @@ import (
 type Config struct {
 	// Enabled 为 false 时所有钩子直接透传，不产生任何文件。
 	Enabled bool
-	// RootDir 归档根目录，默认 ./data/audit。
+	// RootDir 归档根目录，默认 ./data/audit；ActiveDir / ArchiveDir 未配置时位于其下。
 	RootDir string
+	// ActiveDir 新请求写入目录（建议高速盘），默认 {RootDir}/active。
+	// 会话映射（.sessions）与请求索引（.index）也存放在这里。
+	ActiveDir string
+	// ArchiveDir 会话归档目录（可为大容量慢盘），默认 {RootDir}/archive。
+	ArchiveDir string
+	// ArchiveAfter 会话最后一次写入超过该时长后，由夜间任务归档，默认 72h。
+	ArchiveAfter time.Duration
+	// ArchiveAt 每天执行归档的本地时间（HH:MM），默认 03:00；设为 "off" 关闭定时归档。
+	ArchiveAt string
+	// ArchiveEncoderLevel 会话归档的 zstd 级别，默认 better（夜间执行，偏重压缩率）。
+	ArchiveEncoderLevel string
+	// ArchiveWindowMB 会话归档的匹配窗口（MB），需覆盖相邻两次请求的距离，默认 32。
+	// 也是读取归档时的解压内存上限。
+	ArchiveWindowMB int
+	// ActiveWindowMB 单请求文件的匹配窗口（MB），需覆盖客户端请求体到上游请求体的距离，默认 4。
+	ActiveWindowMB int
 	// SessionHeaders 按优先级查找会话 ID 的请求头。
 	SessionHeaders []string
 	// RedactHeaders 落盘前需要脱敏的鉴权类 Header（大小写不敏感）。
@@ -34,7 +54,7 @@ type Config struct {
 	// MemoryBufferBytes 单个文件在内存中累积到该大小前不启用流式压缩，
 	// 结束时一次性压缩；超过后切换为后台流式压缩，避免大正文占用内存。
 	MemoryBufferBytes int
-	// EncoderLevel zstd 压缩级别：fastest / default / better / best。
+	// EncoderLevel active 文件的 zstd 压缩级别：fastest / default / better / best。
 	EncoderLevel string
 	// DisplayBodyLimit 管理接口单段正文的展示上限（字节），超出部分只能下载；
 	// 仅影响展示，不影响存储。
@@ -77,17 +97,22 @@ var DefaultRedactQueryParams = []string{"key", "api_key", "access_token"}
 // DefaultConfig 返回默认配置（默认开启，根目录 ./data/audit）。
 func DefaultConfig() Config {
 	return Config{
-		Enabled:           true,
-		RootDir:           "./data/audit",
-		SessionHeaders:    append([]string(nil), DefaultSessionHeaders...),
-		RedactHeaders:     append([]string(nil), DefaultRedactHeaders...),
-		RedactQueryParams: append([]string(nil), DefaultRedactQueryParams...),
-		SessionCacheSize:  10000,
-		MemoryBufferBytes: 512 << 10,
-		EncoderLevel:      "fastest",
-		DisplayBodyLimit:  4 << 20,
-		FinalizeTimeout:   30 * time.Second,
-		FlushWorkers:      max(4, 2*runtime.GOMAXPROCS(0)),
+		Enabled:             true,
+		RootDir:             "./data/audit",
+		ArchiveAfter:        72 * time.Hour,
+		ArchiveAt:           "03:00",
+		ArchiveEncoderLevel: "better",
+		ArchiveWindowMB:     32,
+		ActiveWindowMB:      4,
+		SessionHeaders:      append([]string(nil), DefaultSessionHeaders...),
+		RedactHeaders:       append([]string(nil), DefaultRedactHeaders...),
+		RedactQueryParams:   append([]string(nil), DefaultRedactQueryParams...),
+		SessionCacheSize:    10000,
+		MemoryBufferBytes:   512 << 10,
+		EncoderLevel:        "default",
+		DisplayBodyLimit:    4 << 20,
+		FinalizeTimeout:     30 * time.Second,
+		FlushWorkers:        max(4, 2*runtime.GOMAXPROCS(0)),
 	}
 }
 
@@ -101,6 +126,27 @@ func ConfigFromViper() Config {
 	}
 	if v := strings.TrimSpace(viper.GetString("audit.root_dir")); v != "" {
 		cfg.RootDir = v
+	}
+	if v := strings.TrimSpace(viper.GetString("audit.active_dir")); v != "" {
+		cfg.ActiveDir = v
+	}
+	if v := strings.TrimSpace(viper.GetString("audit.archive_dir")); v != "" {
+		cfg.ArchiveDir = v
+	}
+	if v := viper.GetDuration("audit.archive_after"); v > 0 {
+		cfg.ArchiveAfter = v
+	}
+	if v := strings.TrimSpace(viper.GetString("audit.archive_at")); v != "" {
+		cfg.ArchiveAt = v
+	}
+	if v := strings.TrimSpace(viper.GetString("audit.archive_encoder_level")); v != "" {
+		cfg.ArchiveEncoderLevel = v
+	}
+	if v := viper.GetInt("audit.archive_window_mb"); v > 0 {
+		cfg.ArchiveWindowMB = v
+	}
+	if v := viper.GetInt("audit.active_window_mb"); v > 0 {
+		cfg.ActiveWindowMB = v
 	}
 	if v := viper.GetStringSlice("audit.session_headers"); len(v) > 0 {
 		cfg.SessionHeaders = splitList(v)

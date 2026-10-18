@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/fs"
-	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,12 +25,13 @@ import (
 // ErrNotArchive 表示文件不是本归档格式。
 var ErrNotArchive = errors.New("audit: not an archive file")
 
-// newDecoder 在内存中流式解压，不产生临时文件。
+// newDecoder 在内存中流式解压，不产生临时文件；内存约为 2 倍压缩窗口。
+// 不用低内存模式：实测 32MB 窗口下低内存模式解压慢约 10 倍（~100MB/s 对 ~1.1GB/s）。
 func newDecoder(r io.Reader) (*zstd.Decoder, error) {
 	return zstd.NewReader(r,
 		zstd.WithDecoderConcurrency(1),
-		zstd.WithDecoderLowmem(true),
-		zstd.WithDecoderMaxWindow(64<<20),
+		zstd.WithDecoderLowmem(false),
+		zstd.WithDecoderMaxWindow(maxWindowBytes),
 	)
 }
 
@@ -44,48 +43,77 @@ type frameReader struct {
 
 type frame struct {
 	typ     byte
+	kind    byte
 	seq     uint16
 	payload []byte
 }
 
-func openFrames(r io.Reader) (*frameReader, error) {
+// openFrames 校验魔数并返回帧读取器。
+func openFrames(r io.Reader, magic string) (*frameReader, error) {
 	br := bufio.NewReaderSize(r, 64<<10)
-	magic := make([]byte, len(fileMagic))
-	if _, err := io.ReadFull(br, magic); err != nil {
+	got := make([]byte, len(magic))
+	if _, err := io.ReadFull(br, got); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, io.EOF
 		}
 		return nil, err
 	}
-	if string(magic) != fileMagic {
+	if string(got) != magic {
 		return nil, ErrNotArchive
 	}
 	return &frameReader{r: br}, nil
 }
 
-// next 读取一帧；payload 复用 buf。返回 io.EOF 表示正常结束，io.ErrUnexpectedEOF 表示截断。
-func (fr *frameReader) next(buf []byte) (frame, error) {
+// header 读取下一帧的帧头。返回 io.EOF 表示正常结束，io.ErrUnexpectedEOF 表示截断。
+func (fr *frameReader) header() (typ, kind byte, seq uint16, n int, err error) {
 	if _, err := io.ReadFull(fr.r, fr.hdr[:]); err != nil {
 		if errors.Is(err, io.EOF) {
-			return frame{}, io.EOF
+			return 0, 0, 0, 0, io.EOF
 		}
-		return frame{}, io.ErrUnexpectedEOF
+		return 0, 0, 0, 0, io.ErrUnexpectedEOF
 	}
-	n := int(binary.BigEndian.Uint32(fr.hdr[3:7]))
+	n = int(binary.BigEndian.Uint32(fr.hdr[4:8]))
 	if n > maxFramePayload+16 {
-		return frame{}, fmt.Errorf("audit: frame too large (%d)", n)
+		return 0, 0, 0, 0, fmt.Errorf("audit: frame too large (%d)", n)
 	}
+	return fr.hdr[0], fr.hdr[1], binary.BigEndian.Uint16(fr.hdr[2:4]), n, nil
+}
+
+// payload 读取当前帧的负载；复用 buf。
+func (fr *frameReader) payload(buf []byte, n int) ([]byte, error) {
 	if cap(buf) < n {
 		buf = make([]byte, n)
 	}
 	buf = buf[:n]
 	if _, err := io.ReadFull(fr.r, buf); err != nil {
-		return frame{}, io.ErrUnexpectedEOF
+		return nil, io.ErrUnexpectedEOF
 	}
-	return frame{typ: fr.hdr[0], seq: binary.BigEndian.Uint16(fr.hdr[1:3]), payload: buf}, nil
+	return buf, nil
 }
 
-// FileView 是单个归档文件的展示视图。
+// skip 跳过当前帧的负载（仍需解压，但不复制）。
+func (fr *frameReader) skip(n int) error {
+	if _, err := fr.r.Discard(n); err != nil {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+// next 读取一帧；payload 复用 buf。
+func (fr *frameReader) next(buf []byte) (frame, error) {
+	typ, kind, seq, n, err := fr.header()
+	if err != nil {
+		return frame{}, err
+	}
+	p, err := fr.payload(buf, n)
+	if err != nil {
+		return frame{}, err
+	}
+	return frame{typ: typ, kind: kind, seq: seq, payload: p}, nil
+}
+
+// FileView 是一个阶段（客户端请求 / 上游请求 / 上游响应 / 客户端响应）的展示视图。
+// 四个阶段存放在同一个压缩流中，压缩大小只在请求级别（ArchiveView.Storage）给出。
 type FileView struct {
 	Kind           string           `json:"kind"`
 	Exists         bool             `json:"exists"`
@@ -153,101 +181,52 @@ type WSMessage struct {
 	Error      string    `json:"error,omitempty"`
 }
 
-// ReadFile 解析一个归档文件。displayLimit 限制每段保留用于展示的正文字节，
-// 超出部分仍参与计数与哈希校验，可通过下载接口完整获取。
-func ReadFile(path, kind string, displayLimit int) *FileView {
-	fv := &FileView{Kind: kind, Sections: []*SectionView{}}
-	st, err := os.Stat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		fv.Status = "missing"
-		return fv
+// readViews 读取一个请求的四个阶段并构建展示视图。displayLimit 限制每段保留用于展示的
+// 正文字节，超出部分仍参与计数与哈希校验，可通过下载接口完整获取。
+func (s *Store) readViews(ref string, displayLimit int) ([]*FileView, StorageInfo) {
+	views := make([]*FileView, len(Kinds))
+	latest := make([]map[uint16]*SectionView, len(Kinds))
+	for i, k := range Kinds {
+		views[i] = &FileView{Kind: k, Exists: true, Status: "ok", Sections: []*SectionView{}}
+		latest[i] = map[uint16]*SectionView{}
 	}
-	if err != nil {
-		fv.Status, fv.Error = "error", err.Error()
-		return fv
-	}
-	fv.Exists = true
-	fv.CompressedSize = st.Size()
-	if st.Size() == 0 {
-		// 文件已创建但尚未落盘：请求仍在进行，或进程在落盘前退出。
-		fv.Status = "empty"
-		return fv
-	}
-	f, err := os.Open(path) //nolint:gosec // 路径已由 FilePath 校验
-	if err != nil {
-		fv.Status, fv.Error = "error", err.Error()
-		return fv
-	}
-	defer func() { _ = f.Close() }()
-	dec, err := newDecoder(f)
-	if err != nil {
-		fv.Status, fv.Error = "corrupt", err.Error()
-		return fv
-	}
-	defer dec.Close()
-	counter := &countingReader{r: dec}
-	fr, err := openFrames(counter)
-	if err != nil {
-		fv.Status, fv.Error = "corrupt", err.Error()
-		return fv
-	}
-	latest := map[uint16]*SectionView{}
-	var buf []byte
-	fv.Status = "ok"
-	for {
-		fr2, err := fr.next(buf)
-		if errors.Is(err, io.EOF) {
-			break
+	info, _ := s.walkRequest(ref, func(f frame) bool {
+		if int(f.kind) >= len(views) {
+			return true
 		}
-		if err != nil {
-			fv.Status, fv.Error = "truncated", err.Error()
-			break
-		}
-		buf = fr2.payload[:0]
-		switch fr2.typ {
+		fv := views[f.kind]
+		fv.RawSize += int64(frameHeaderSize + len(f.payload))
+		switch f.typ {
 		case FrameHeader:
-			sv := &SectionView{Index: len(fv.Sections), Seq: int(fr2.seq), hash: sha256.New(), xxh: xxhash.New(), limit: displayLimit}
-			if err := json.Unmarshal(fr2.payload, &sv.Header); err != nil {
-				sv.Header.Kind = kind
+			sv := &SectionView{Index: len(fv.Sections), Seq: int(f.seq), hash: sha256.New(), xxh: xxhash.New(), limit: displayLimit}
+			if err := json.Unmarshal(f.payload, &sv.Header); err != nil {
+				sv.Header.Kind = fv.Kind
 			}
 			fv.Sections = append(fv.Sections, sv)
-			latest[fr2.seq] = sv
+			latest[f.kind][f.seq] = sv
 		case FrameNote:
 			var note map[string]any
-			if json.Unmarshal(fr2.payload, &note) == nil {
+			if json.Unmarshal(f.payload, &note) == nil {
 				fv.Notes = append(fv.Notes, note)
 			}
 		default:
-			sv := latest[fr2.seq]
-			if sv == nil {
-				continue
+			if sv := latest[f.kind][f.seq]; sv != nil {
+				sv.consume(f)
 			}
-			sv.consume(fr2)
+		}
+		return true
+	})
+	for _, fv := range views {
+		if info.Status != "ok" {
+			// 四个阶段共用一条压缩流：流的状态即每个阶段的状态。
+			fv.Status, fv.Error = info.Status, info.Error
+			fv.Exists = info.Status != "missing"
+		}
+		for _, sv := range fv.Sections {
+			sv.finalize()
 		}
 	}
-	fv.RawSize = counter.n
-	if fv.Status == "ok" && counter.err != nil && !errors.Is(counter.err, io.EOF) {
-		fv.Status, fv.Error = "truncated", counter.err.Error()
-	}
-	for _, sv := range fv.Sections {
-		sv.finalize()
-	}
-	return fv
-}
-
-type countingReader struct {
-	r   io.Reader
-	n   int64
-	err error
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	if err != nil {
-		c.err = err
-	}
-	return n, err
+	return views, info
 }
 
 func (sv *SectionView) consume(f frame) {

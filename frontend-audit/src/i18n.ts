@@ -53,6 +53,13 @@ const zh = {
     corrupt: '文件损坏',
     error: '读取错误'
   } as Record<string, string>,
+  storage: {
+    active: 'active（逐请求压缩）',
+    archive: 'archive（会话整体压缩）',
+    missing: '缺失'
+  } as Record<string, string>,
+  requestSize: '本请求',
+  sessionSize: '会话文件',
   noSections: '无内容',
   headers: '请求头 / 响应头',
   body: '正文',
@@ -141,6 +148,13 @@ const en: Dict = {
     corrupt: 'File corrupt',
     error: 'Read error'
   },
+  storage: {
+    active: 'active (per request)',
+    archive: 'archive (whole session)',
+    missing: 'missing'
+  },
+  requestSize: 'request',
+  sessionSize: 'session file',
   noSections: 'No content',
   headers: 'Headers',
   body: 'Body',

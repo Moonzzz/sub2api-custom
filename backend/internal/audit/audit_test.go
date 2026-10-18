@@ -55,22 +55,18 @@ func waitFlush(t *testing.T, s *Store) {
 	_ = ctx
 }
 
-// decompressedAll 把四份文件解压后拼接，用于检查鉴权原值是否泄漏。
+// decompressedAll 解压请求文件（四个阶段），用于检查鉴权原值是否泄漏。
 func decompressedAll(t *testing.T, s *Store, ref string) []byte {
 	t.Helper()
 	var all bytes.Buffer
-	for _, k := range Kinds {
-		p, err := s.FilePath(ref, k)
-		require.NoError(t, err)
-		f, err := os.Open(p)
-		require.NoError(t, err)
-		dec, err := newDecoder(f)
-		require.NoError(t, err)
-		_, err = io.Copy(&all, dec)
-		require.NoError(t, err)
-		dec.Close()
-		_ = f.Close()
-	}
+	f, err := os.Open(s.activeRequestPath(ref))
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	dec, err := newDecoder(f)
+	require.NoError(t, err)
+	defer dec.Close()
+	_, err = io.Copy(&all, dec)
+	require.NoError(t, err)
 	return all.Bytes()
 }
 
@@ -209,11 +205,14 @@ func doClient(t *testing.T, r http.Handler, path string, body []byte, headers ma
 func onlyRef(t *testing.T, s *Store, session string) string {
 	t.Helper()
 	var refs []string
-	root := s.Root()
+	root := s.ActiveDir()
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasSuffix(p, "-client_request.zst") {
+		if err == nil && d.IsDir() && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".zst") {
 			rel, _ := filepath.Rel(root, p)
-			refs = append(refs, strings.TrimSuffix(filepath.ToSlash(rel), "-client_request.zst"))
+			refs = append(refs, strings.TrimSuffix(filepath.ToSlash(rel), ".zst"))
 		}
 		return nil
 	})
@@ -234,7 +233,7 @@ func TestMaskSecret(t *testing.T) {
 	require.Equal(t, "keep-me-unchanged", h["X-Other"][0])
 }
 
-func TestHTTPArchiveFourFilesIntegrityAndRedaction(t *testing.T) {
+func TestHTTPArchiveFourKindsIntegrityAndRedaction(t *testing.T) {
 	s := newTestStore(t, nil)
 	cap := &upstreamCapture{}
 	up := newUpstream(t, cap, false)
@@ -427,17 +426,25 @@ func TestTruncatedAndEmptyArchives(t *testing.T) {
 	sec.end(true, "", nil)
 	rec.Finish()
 	s.pending.Wait()
-	p, _ := s.FilePath(rec.ArchiveRef(), KindClientRequest)
+	p := s.activeRequestPath(rec.ArchiveRef())
 	st, _ := os.Stat(p)
 	require.NoError(t, os.Truncate(p, st.Size()/2))
-	p2, _ := s.FilePath(rec.ArchiveRef(), KindClientResponse)
-	require.NoError(t, os.Truncate(p2, 0))
 	av, err := s.ReadArchive(rec.ArchiveRef())
 	require.NoError(t, err)
 	require.NotEqual(t, "complete", av.Status)
 	require.Contains(t, []string{"truncated", "corrupt"}, av.Files[0].Status)
-	require.Equal(t, "empty", av.Files[3].Status)
 	require.NotEmpty(t, av.Issues)
+
+	// 已创建但未落盘的空文件：视为进行中。
+	rec2, err := s.Begin("empty", "", "", time.Now())
+	require.NoError(t, err)
+	rec2.Finish()
+	s.pending.Wait()
+	require.NoError(t, os.Truncate(s.activeRequestPath(rec2.ArchiveRef()), 0))
+	av, err = s.ReadArchive(rec2.ArchiveRef())
+	require.NoError(t, err)
+	require.Equal(t, "in_progress", av.Status)
+	require.Equal(t, "empty", av.Files[3].Status)
 
 	av2, err := s.ReadArchive("2026-01/01/nosession/none-1")
 	require.NoError(t, err)

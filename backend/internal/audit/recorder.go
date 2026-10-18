@@ -39,7 +39,7 @@ func FromContext(ctx context.Context) *Recorder {
 	return r
 }
 
-// Recorder 是单个客户端请求的归档器（四个文件）。
+// Recorder 是单个客户端请求的归档器（四个阶段写入同一个文件）。
 type Recorder struct {
 	store         *Store
 	ID            string
@@ -50,7 +50,7 @@ type Recorder struct {
 	SpanID        string
 	Started       time.Time
 
-	files    [4]*archiveFile
+	file     *archiveFile
 	attempts atomic.Int32
 	finished atomic.Bool
 
@@ -60,9 +60,17 @@ type Recorder struct {
 	ref    string
 	usage  []IndexEntry // 结束前收到的用量回调，落盘时写入索引
 
-	filesOnce sync.Once
-	filesRes  [4]*os.File
-	filesErr  error
+	fileOnce sync.Once
+	fileRes  *os.File
+	fileErr  error
+	unlock   func() // 会话写入锁，文件关闭后释放
+}
+
+func (r *Recorder) releaseLock() {
+	if r.unlock != nil {
+		r.unlock()
+		r.unlock = nil
+	}
 }
 
 // ArchiveRef 返回归档位置（相对根目录）；文件尚未创建时为空。
@@ -70,15 +78,6 @@ func (r *Recorder) ArchiveRef() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ref
-}
-
-func (r *Recorder) file(kind string) *archiveFile {
-	for i, k := range Kinds {
-		if k == kind {
-			return r.files[i]
-		}
-	}
-	return nil
 }
 
 // NextAttempt 分配一个上游调度尝试序号（从 1 开始）。
@@ -93,6 +92,7 @@ func (r *Recorder) Attempts() int { return int(r.attempts.Load()) }
 type section struct {
 	rec      *Recorder
 	file     *archiveFile
+	kind     byte
 	seq      uint16
 	mu       sync.Mutex
 	h        *xxhash.Digest
@@ -106,10 +106,11 @@ func (r *Recorder) startSection(kind string, hdr SectionHeader) *section {
 	if r == nil || r.finished.Load() {
 		return nil
 	}
-	f := r.file(kind)
-	if f == nil {
+	ki := kindIndex(kind)
+	if ki < 0 {
 		return nil
 	}
+	f := r.file
 	hdr.Kind = kind
 	if hdr.Time.IsZero() {
 		hdr.Time = time.Now()
@@ -119,11 +120,11 @@ func (r *Recorder) startSection(kind string, hdr SectionHeader) *section {
 		return nil
 	}
 	seq := uint16(hdr.Seq) //nolint:gosec // attempts are bounded far below 65535
-	if err := f.writeFrame(FrameHeader, seq, payload); err != nil {
+	if err := f.writeFrame(FrameHeader, byte(ki), seq, payload); err != nil {
 		r.store.stats.DroppedWrites.Add(1)
 		return nil
 	}
-	s := &section{rec: r, file: f, seq: seq, h: xxhash.New()}
+	s := &section{rec: r, file: f, kind: byte(ki), seq: seq, h: xxhash.New()}
 	r.mu.Lock()
 	r.open[s] = struct{}{}
 	r.mu.Unlock()
@@ -139,7 +140,7 @@ func (s *section) body(p []byte) {
 	if s.ended {
 		return
 	}
-	if err := s.file.writeFrame(FrameBody, s.seq, p); err != nil {
+	if err := s.file.writeFrame(FrameBody, s.kind, s.seq, p); err != nil {
 		s.rec.store.stats.DroppedWrites.Add(1)
 		return
 	}
@@ -157,7 +158,7 @@ func (s *section) raw(p []byte) {
 	if s.ended {
 		return
 	}
-	if err := s.file.writeFrame(FrameRaw, s.seq, p); err != nil {
+	if err := s.file.writeFrame(FrameRaw, s.kind, s.seq, p); err != nil {
 		s.rec.store.stats.DroppedWrites.Add(1)
 		return
 	}
@@ -178,7 +179,7 @@ func (s *section) message(op byte, data []byte) {
 	buf[0] = op
 	binary.BigEndian.PutUint64(buf[1:9], uint64(time.Now().UnixNano())) //nolint:gosec // 时间戳为正
 	copy(buf[9:], data)
-	if err := s.file.writeFrame(FrameMsg, s.seq, buf); err != nil {
+	if err := s.file.writeFrame(FrameMsg, s.kind, s.seq, buf); err != nil {
 		s.rec.store.stats.DroppedWrites.Add(1)
 		return
 	}
@@ -206,7 +207,7 @@ func (s *section) end(complete bool, errText string, meta map[string]any) {
 		Messages: s.messages,
 	}
 	payload, _ := json.Marshal(e)
-	if err := s.file.writeFrame(FrameEnd, s.seq, payload); err != nil {
+	if err := s.file.writeFrame(FrameEnd, s.kind, s.seq, payload); err != nil {
 		s.rec.store.stats.DroppedWrites.Add(1)
 	}
 	s.mu.Unlock()
@@ -221,8 +222,8 @@ func (r *Recorder) Note(kind string, seq int, note map[string]any) {
 	if r == nil || r.finished.Load() {
 		return
 	}
-	f := r.file(kind)
-	if f == nil {
+	ki := kindIndex(kind)
+	if ki < 0 {
 		return
 	}
 	note = maps.Clone(note)
@@ -234,7 +235,7 @@ func (r *Recorder) Note(kind string, seq int, note map[string]any) {
 	if err != nil {
 		return
 	}
-	if f.writeFrame(FrameNote, uint16(seq), payload) != nil { //nolint:gosec // bounded
+	if r.file.writeFrame(FrameNote, byte(ki), uint16(seq), payload) != nil { //nolint:gosec // bounded
 		r.store.stats.DroppedWrites.Add(1)
 	}
 }
@@ -268,21 +269,20 @@ func (r *Recorder) Finish() {
 		r.store.flushSem <- struct{}{}
 		r.store.stats.FlushBacklog.Add(-1)
 		defer func() { <-r.store.flushSem }()
-		if _, err := r.ensureFiles(); err == nil {
+		if _, err := r.ensureFile(); err == nil {
 			ref := r.ArchiveRef()
 			for _, e := range usage {
 				e.Ref = ref
 				r.store.writeUsageIndex(e)
 			}
 		}
-		var raw int64
-		for _, f := range r.files {
-			raw += f.rawSize()
-			if err := f.close(); err != nil {
-				r.store.stats.CloseErrors.Add(1)
-				slog.Warn("audit_archive_close_failed", "request_id", r.ID, "error", err)
-			}
+		raw := r.file.rawSize()
+		if err := r.file.close(); err != nil {
+			r.store.stats.CloseErrors.Add(1)
+			slog.Warn("audit_archive_close_failed", "request_id", r.ID, "error", err)
 		}
+		// 文件已完整落盘（或创建失败），释放会话写入锁，夜间归档方可处理该会话。
+		r.releaseLock()
 		r.store.stats.RawBytes.Add(raw)
 	}()
 }

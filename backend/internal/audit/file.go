@@ -19,24 +19,50 @@ type codec struct {
 	opts    []zstd.EOption
 }
 
-func newCodec(level string) (*codec, error) {
-	lvl := zstd.SpeedFastest
+func encoderLevel(level string) zstd.EncoderLevel {
 	switch level {
 	case "default":
-		lvl = zstd.SpeedDefault
+		return zstd.SpeedDefault
 	case "better":
-		lvl = zstd.SpeedBetterCompression
+		return zstd.SpeedBetterCompression
 	case "best":
-		lvl = zstd.SpeedBestCompression
+		return zstd.SpeedBestCompression
 	}
-	opts := []zstd.EOption{
-		zstd.WithEncoderLevel(lvl),
+	return zstd.SpeedFastest
+}
+
+// encoderOptions 返回压缩选项。windowMB 为匹配窗口（MB，2 的幂向上取整），
+// 决定能回溯去重的最大距离，也决定解压内存（约 2 倍窗口）。
+//
+// lowMem：单请求文件（几 MB 以内、并发多）用低内存模式；会话归档（长流、单线程）
+// 关闭低内存模式——实测 32MB 窗口下低内存模式压缩慢约 40 倍（15MB/s 对 550MB/s）。
+func encoderOptions(level string, windowMB int, lowMem bool) []zstd.EOption {
+	return []zstd.EOption{
+		zstd.WithEncoderLevel(encoderLevel(level)),
 		zstd.WithEncoderConcurrency(1),
-		zstd.WithLowerEncoderMem(true),
-		zstd.WithWindowSize(1 << 20),
+		zstd.WithLowerEncoderMem(lowMem),
+		zstd.WithWindowSize(windowBytes(windowMB)),
 		zstd.WithEncoderCRC(true),
 		zstd.WithZeroFrames(true),
 	}
+}
+
+func windowBytes(mb int) int {
+	if mb <= 0 {
+		mb = 1
+	}
+	w := zstd.MinWindowSize
+	for w < mb<<20 && w < maxWindowBytes {
+		w <<= 1
+	}
+	return w
+}
+
+// maxWindowBytes 是允许的最大匹配窗口；读取端按此值限制解压内存。
+const maxWindowBytes = 128 << 20
+
+func newCodec(level string, windowMB int) (*codec, error) {
+	opts := encoderOptions(level, windowMB, true)
 	all, err := zstd.NewWriter(nil, opts...)
 	if err != nil {
 		return nil, err
@@ -57,7 +83,7 @@ func (c *codec) putStream(enc *zstd.Encoder) {
 	c.streams.Put(enc)
 }
 
-// archiveFile 是单个 .zst 归档文件的写入端。
+// archiveFile 是单个请求的 .zst 文件写入端（四个阶段共用一条压缩流）。
 //
 // 写入路径只做内存追加（拷贝），不在业务 goroutine 上压缩，也不做任何文件系统操作：
 //   - 原始内容不超过 threshold 时，关闭阶段一次性 EncodeAll；
@@ -82,13 +108,13 @@ type archiveFile struct {
 
 func newArchiveFile(open func() (*os.File, error), c *codec, threshold int) *archiveFile {
 	af := &archiveFile{codec: c, open: open, threshold: threshold}
-	af.buf = append(make([]byte, 0, 4096), fileMagic...)
-	af.raw = int64(len(fileMagic))
+	af.buf = append(make([]byte, 0, 4096), requestMagic...)
+	af.raw = int64(len(requestMagic))
 	return af
 }
 
 // writeFrame 追加一个帧；payload 超过 maxFramePayload 时自动拆分。
-func (a *archiveFile) writeFrame(typ byte, seq uint16, payload []byte) error {
+func (a *archiveFile) writeFrame(typ, kind byte, seq uint16, payload []byte) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -99,7 +125,7 @@ func (a *archiveFile) writeFrame(typ byte, seq uint16, payload []byte) error {
 		if n > maxFramePayload {
 			n = maxFramePayload
 		}
-		a.appendLocked(typ, seq, payload[:n])
+		a.appendLocked(typ, kind, seq, payload[:n])
 		payload = payload[n:]
 		if len(payload) == 0 {
 			return nil
@@ -107,10 +133,10 @@ func (a *archiveFile) writeFrame(typ byte, seq uint16, payload []byte) error {
 	}
 }
 
-func (a *archiveFile) appendLocked(typ byte, seq uint16, payload []byte) {
+func (a *archiveFile) appendLocked(typ, kind byte, seq uint16, payload []byte) {
 	a.raw += int64(frameHeaderSize + len(payload))
 	if !a.streaming {
-		a.buf = encodeFrameHeader(a.buf, typ, seq, len(payload))
+		a.buf = encodeFrameHeader(a.buf, typ, kind, seq, len(payload))
 		a.buf = append(a.buf, payload...)
 		if len(a.buf) > a.threshold {
 			a.startStreamLocked()
@@ -118,7 +144,7 @@ func (a *archiveFile) appendLocked(typ byte, seq uint16, payload []byte) {
 		return
 	}
 	chunk := make([]byte, 0, frameHeaderSize+len(payload))
-	chunk = encodeFrameHeader(chunk, typ, seq, len(payload))
+	chunk = encodeFrameHeader(chunk, typ, kind, seq, len(payload))
 	chunk = append(chunk, payload...)
 	a.queue = append(a.queue, chunk)
 	a.cond.Signal()

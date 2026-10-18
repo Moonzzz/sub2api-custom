@@ -203,7 +203,33 @@ export async function downloadBody(ref: string, kind: ArchiveKind, index: number
   const filename = match?.[1] || `${ref.split('/').pop()}-${kind}-${index}${decode ? '-decoded' : ''}.bin`
   const expectedSha256 = (resp.headers['x-archive-body-sha256'] as string | undefined) || undefined
   const actualSha256 = !decode ? await sha256Hex(blob) : undefined
-  return { blob, filename: decode ? filename.replace(/\.bin$/, '-decoded.bin') : filename, expectedSha256, actualSha256 }
+  return { blob, filename, expectedSha256, actualSha256 }
+}
+
+// 差异对比用的完整正文（按 Content-Encoding 解码），按归档引用缓存，避免重复下载。
+const fullTextCache = new Map<string, Promise<string>>()
+
+/** 读取某段的完整正文文本（不受展示上限截断）。 */
+export function fetchFullBodyText(ref: string, kind: ArchiveKind, index: number): Promise<string> {
+  const key = `${ref}|${kind}|${index}`
+  let p = fullTextCache.get(key)
+  if (!p) {
+    p = apiClient
+      .get<Blob>(`${BASE}/body`, { params: { ref, kind, index, decode: 1 }, responseType: 'blob', timeout: 0 })
+      .then((resp) => resp.data.text())
+    p.catch(() => fullTextCache.delete(key))
+    if (fullTextCache.size > 32) fullTextCache.delete(fullTextCache.keys().next().value as string)
+    fullTextCache.set(key, p)
+  }
+  return p
+}
+
+/** 下载整个请求：zip 内为该请求的存档数据原样（单个 .zst）。 */
+export async function downloadBundle(ref: string): Promise<DownloadResult> {
+  const resp = await apiClient.get<Blob>(`${BASE}/bundle`, { params: { ref }, responseType: 'blob', timeout: 0 })
+  const disposition = String(resp.headers['content-disposition'] || '')
+  const match = /filename="?([^";]+)"?/.exec(disposition)
+  return { blob: resp.data, filename: match?.[1] || `${ref.split('/').pop()}.zip` }
 }
 
 export function saveBlob(blob: Blob, filename: string) {

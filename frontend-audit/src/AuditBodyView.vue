@@ -43,7 +43,13 @@ const MIN_HEIGHT = 60
 // 只用于选择语言模式（不解析）：以 { / [ 开头按 JSON 展示
 const json = computed(() => /^\s*[[{]/.test(props.text))
 const wrap = ref(false)
-const height = ref(MIN_HEIGHT)
+// 先按文本估算高度（单行长 JSON 排版后通常超过上限），编辑器加载与排版过程中不再明显撑高。
+function estimateHeight(t: string): number {
+  const lines = t.split('\n').length
+  if (lines === 1 && /^\s*[[{]/.test(t) && t.length > 200) return MAX_HEIGHT
+  return Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, lines * 18 + 10))
+}
+const height = ref(estimateHeight(props.text))
 const loading = ref(true)
 const loadError = ref('')
 const ready = ref(false)

@@ -149,9 +149,9 @@ zstd -dc archive/2026-10/14/sess.zst | less
 | `GET /api/v1/admin/audit-archive/usage/:id[?ref=]` | 按用量记录查找并解析归档；`resolution` = `unique` / `best_match_with_alternatives` / `ambiguous` / `not_found` / `chosen` |
 | `GET /api/v1/admin/audit-archive/lookup?request_id=` | 按任意请求 ID 查候选 |
 | `GET /api/v1/admin/audit-archive/archive?ref=` | 解析指定请求的四个阶段（`storage.location` = `active` / `archive`） |
-| `GET /api/v1/admin/audit-archive/body?ref=&kind=&index=&decode=0\|1` | 流式下载某段正文；`decode=0` 为原始字节（响应头 `X-Archive-Body-SHA256` 可校验），`decode=1` 按 Content-Encoding 解码 |
+| `GET /api/v1/admin/audit-archive/body?ref=&kind=&index=&decode=0\|1` | 流式下载某段正文；`decode=0` 为原始字节（响应头 `X-Archive-Body-SHA256` 可校验），`decode=1` 按 Content-Encoding 解码。文件名 `{请求}-{阶段}-{段序号}[-decoded]{后缀}`：保留原始压缩字节时按编码为 `.gz` / `.br` / `.zst` / `.deflate`，否则 JSON 与 SSE 为 `.json`、其它文本为 `.txt`、其余为 `.bin` |
 
-| `GET /api/v1/admin/audit-archive/bundle?ref=` | 下载一个请求的全部阶段（单个 `.zst`，格式同 active 请求文件，四阶段共用压缩）；在 active 中时直接发送文件字节 |
+| `GET /api/v1/admin/audit-archive/bundle?ref=` | 下载整个请求：`{请求}.zip`，内含一个文件 `{请求}.zst`，即该请求的存档数据原样（四阶段共用一条压缩流，格式同 active 请求文件）；请求在 active 时为文件原字节，已归档的从会话归档还原为同格式。zip 条目不再压缩（Store） |
 | `POST /api/v1/admin/audit-archive/archive/run` | 立即执行一次归档（同步返回结果；已在执行时 409） |
 
 读取全程在内存中流式解压，**不产生任何临时文件**。
@@ -188,6 +188,30 @@ cd backend && go build -tags embed -o sub2api ./cmd/server
 - Monaco 放在 `frontend-audit/deps/`，有独立的 `package.json` 和 lockfile，`build.sh` 会自动安装。原 `frontend/package.json` 不修改。
 - 构建时单独成包（`audit-monaco-*.js`，约 1 MB gzip，外加两个 Worker 约 200 KB）。只在打开归档正文时按需加载，首页预加载内容与原版一致。
 - 兼容默认 CSP：`worker-src 'self' blob:`、内联样式、`data:` 字体均已允许。
+
+### 差异对比与 SSE 合并
+
+| 位置 | 基底 | 对比 |
+|---|---|---|
+| 「实际上游请求」标签：正文、请求头的「差异」按钮 | 客户端请求 | 该次上游尝试的实际请求 |
+| 「客户端响应」标签：正文、响应头的「差异」按钮 | 上游响应（多次尝试时可选，默认最后一次） | 客户端响应 |
+
+- 正文取**完整内容**（`/body?decode=1`），不受展示上限截断；对比不忽略空白、不设计算时限。
+- JSON 按原文排版后对比：只在字符串之外插入换行缩进，`\u003c` 等转义与数字写法逐字保留，字节层面的差异都能看到。
+- 报文头按 HTTP 文本对比：请求首行 `METHOD URL PROTO`、响应首行 `PROTO STATUS REASON`，其后 `Name: value` 按头名（不区分大小写）排序。
+- SSE 跟随展示模式：「SSE 事件」模式按合并后的事件对比，「原文」模式按原始文本对比。
+- 「SSE 事件」模式下合并增量事件（展示与对比共用，原文与下载不受影响）：
+
+  | 协议 | 合并的增量 | 开始 / 结束边界 |
+  |---|---|---|
+  | Anthropic | `content_block_delta`（按 `index` + `delta.type`，拼接 `text` / `partial_json` / `thinking` / `signature`） | `message_start/stop`、`content_block_start/stop` |
+  | OpenAI Responses | `response.*.delta`（按 `item_id` / `output_index` / `content_index`，拼接 `delta`） | `response.created/completed/failed/incomplete`、`*.added`、`*.done` |
+  | OpenAI Chat | `choices[].delta`（按 choice、tool_call 下标，拼接 `content` / `reasoning_content` / `arguments` 等） | 带 `finish_reason` 的块、`[DONE]` |
+  | Gemini | `candidates[].content.parts[].text` | 带 `finishReason` 的块 |
+
+  没遇到边界就持续合并同一内容块的增量；中间的其它事件（`ping`、`message_delta` 等）原样保留；只做无损合并，遇到无法无损合并的字段另起一组。
+
+切换标签不重建已打开的编辑器（访问过的标签保持挂载），弹窗固定高度，内容变化只在弹窗内滚动。
 
 ## 5. 传输压缩（Nginx）
 

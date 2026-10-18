@@ -1,10 +1,12 @@
 package audit
 
 import (
+	"archive/zip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"strconv"
@@ -275,7 +277,11 @@ func handleBody(c *gin.Context) {
 	_, err = s.StreamBody(c.Writer, ref, kind, index, decode, func(info BodyInfo) {
 		started = true
 		h := info.Header
-		name := fmt.Sprintf("%s-%s-%d.bin", path.Base(ref), kind, index)
+		suffix := ""
+		if decode {
+			suffix = "-decoded"
+		}
+		name := fmt.Sprintf("%s-%s-%d%s%s", path.Base(ref), kind, index, suffix, bodyFileExt(h.Header, decode))
 		c.Header("Content-Type", "application/octet-stream")
 		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 		c.Header("X-Content-Type-Options", "nosniff")
@@ -305,8 +311,36 @@ func handleBody(c *gin.Context) {
 	}
 }
 
-// handleBundle 下载一个请求的全部阶段（单个 zstd 流，格式同 active 请求文件）。
-// 四个阶段共用一次压缩，适合整体传输；请求仍在 active 时直接发送文件字节，不重新压缩。
+// bodyFileExt 按正文类型给下载文件后缀：保留原始压缩字节时按 Content-Encoding；
+// 否则 JSON 与 SSE 为 .json，其它文本为 .txt，识别不了的为 .bin。
+func bodyFileExt(h map[string][]string, decoded bool) string {
+	enc := strings.ToLower(strings.TrimSpace(headerValue(h, "Content-Encoding")))
+	if !decoded && enc != "" && enc != "identity" {
+		switch enc {
+		case "gzip", "x-gzip":
+			return ".gz"
+		case "br":
+			return ".br"
+		case "zstd":
+			return ".zst"
+		case "deflate":
+			return ".deflate"
+		}
+		return ".bin"
+	}
+	ct := strings.ToLower(headerValue(h, "Content-Type"))
+	switch {
+	case strings.Contains(ct, "json"), strings.HasPrefix(ct, "text/event-stream"):
+		return ".json"
+	case strings.HasPrefix(ct, "text/"):
+		return ".txt"
+	}
+	return ".bin"
+}
+
+// handleBundle 下载整个请求：zip 内只有一个文件 {请求}.zst，即该请求的存档数据原样
+// （四个阶段共用一条 zstd 流，格式同 active 请求文件；已归档的请求从会话归档中还原为同格式）。
+// zip 条目使用 Store（.zst 已压缩，不再二次压缩）。
 func handleBundle(c *gin.Context) {
 	s := storeOr503(c)
 	if s == nil {
@@ -317,36 +351,57 @@ func handleBundle(c *gin.Context) {
 		response.BadRequest(c, "invalid ref")
 		return
 	}
-	cw := &lazyHeaderWriter{w: c.Writer, onFirst: func() {
-		c.Header("Content-Type", "application/zstd")
-		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(ref)+".zst"))
+	base := path.Base(ref)
+	var zw *zip.Writer
+	entry := &lazyHeaderWriter{onFirst: func() (io.Writer, error) {
+		c.Header("Content-Type", "application/zip")
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", base+".zip"))
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("Cache-Control", "private, no-store")
 		c.Status(http.StatusOK)
+		zw = zip.NewWriter(c.Writer)
+		return zw.CreateHeader(&zip.FileHeader{Name: base + ".zst", Method: zip.Store, Modified: time.Now()})
 	}}
-	info, err := s.WriteRequestBundle(cw, ref)
-	if err != nil && !cw.started {
+	_, err := s.WriteRequestBundle(entry, ref)
+	if !entry.started {
 		if errors.Is(err, errRequestNotFound) {
 			response.NotFound(c, "archive not found")
 			return
 		}
-		response.InternalError(c, "archive read failed: "+err.Error())
+		msg := "empty archive"
+		if err != nil {
+			msg = err.Error()
+		}
+		response.InternalError(c, "archive read failed: "+msg)
 		return
 	}
-	_ = info
+	if err != nil {
+		// 响应头已发出：不写 zip 目录，客户端得到的是无法解开的不完整文件，而不是“看似完整”的文件。
+		slog.Warn("audit_bundle_stream_failed", "ref", ref, "error", err)
+		return
+	}
+	_ = zw.Close()
 }
 
-// lazyHeaderWriter 在第一次写入时才发送响应头，便于出错时仍能返回 JSON 错误。
+// lazyHeaderWriter 在第一次写入时才发送响应头并取得真正的写入目标，
+// 便于读取失败（例如请求不存在）时仍能返回 JSON 错误。
 type lazyHeaderWriter struct {
 	w       io.Writer
-	onFirst func()
+	onFirst func() (io.Writer, error)
 	started bool
 }
 
 func (l *lazyHeaderWriter) Write(p []byte) (int, error) {
 	if !l.started {
 		l.started = true
-		l.onFirst()
+		w, err := l.onFirst()
+		if err != nil {
+			return 0, err
+		}
+		l.w = w
+	}
+	if l.w == nil {
+		return 0, io.ErrClosedPipe
 	}
 	return l.w.Write(p)
 }

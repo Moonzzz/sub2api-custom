@@ -22,7 +22,18 @@
     </div>
 
     <details v-if="headerRows.length" class="as-details">
-      <summary>{{ text.headers }} ({{ headerRows.length }})</summary>
+      <summary>
+        {{ text.headers }} ({{ headerRows.length }})
+        <button
+          v-if="target"
+          type="button"
+          class="as-btn as-btn--sm"
+          :class="{ 'as-btn--on': headerDiff }"
+          data-testid="audit-header-diff"
+          :title="diffTitle"
+          @click.prevent.stop="headerDiff = !headerDiff"
+        >{{ headerDiff ? text.diffExit : text.diff }}</button>
+      </summary>
       <div class="as-table-wrap">
         <table class="as-table">
           <tbody>
@@ -34,6 +45,14 @@
         </table>
       </div>
     </details>
+    <AuditDiffView
+      v-if="headerDiff && target"
+      compact
+      :original="headersToHTTP(target.section.header, isResponse)"
+      :modified="headersToHTTP(h, isResponse)"
+      :original-label="target.label"
+      :modified-label="selfLabel"
+    />
     <details v-if="metaRows.length" class="as-details">
       <summary>meta ({{ metaRows.length }})</summary>
       <pre class="as-pre">{{ JSON.stringify(meta, null, 2) }}</pre>
@@ -47,26 +66,56 @@
         </span>
         <span v-if="body.decode_error" class="as-badge as-badge--warn">{{ body.decode_error }}</span>
         <span class="as-spacer"></span>
+        <template v-if="target">
+          <select v-if="diffTargets!.length > 1" v-model="targetIndex" class="as-select" data-testid="audit-diff-target">
+            <option v-for="(t, i) in diffTargets" :key="i" :value="i">{{ text.diffBase }}: {{ t.label }}</option>
+          </select>
+          <button
+            type="button"
+            class="as-btn"
+            :class="{ 'as-btn--on': bodyDiff }"
+            data-testid="audit-body-diff"
+            :title="diffTitle"
+            @click="bodyDiff = !bodyDiff"
+          >{{ bodyDiff ? text.diffExit : text.diff }}</button>
+        </template>
         <button type="button" class="as-btn" :disabled="downloading" data-testid="audit-download-raw" @click="download(false)">{{ text.downloadRaw }}</button>
         <button v-if="body.content_encoding" type="button" class="as-btn" :disabled="downloading" @click="download(true)">{{ text.downloadDecoded }}</button>
       </div>
       <p v-if="downloadMsg" class="as-note" :class="downloadOk ? 'as-note--ok' : 'as-note--bad'" data-testid="audit-download-result">{{ downloadMsg }}</p>
       <p v-if="body.truncated_for_display" class="as-note as-note--warn">{{ text.truncatedForUI }}</p>
 
-      <template v-if="body.sse?.length">
-        <div class="as-muted">
-          {{ text.sseEvents }}: {{ body.sse.length }} ·
+      <div v-if="body.sse?.length || sseDiff" class="as-muted">
+        <template v-if="body.sse?.length">
+          {{ text.sseEvents }}: {{ body.sse.length }}<template v-if="mergedEvents.length !== body.sse.length"> → {{ mergedEvents.length }} ({{ text.merged }})</template> ·
           <span :class="body.sse_terminated ? 'as-ok' : 'as-warn'">{{ body.sse_terminated ? text.sseTerminated : text.sseNotTerminated }}</span>
-          <button type="button" class="as-btn as-btn--link" @click="showRawSSE = !showRawSSE">{{ showRawSSE ? text.sseEvents : text.rawText }}</button>
-        </div>
+        </template>
+        <button type="button" class="as-btn as-btn--link" data-testid="audit-sse-mode" @click="showRawSSE = !showRawSSE">{{ showRawSSE ? text.sseEvents : text.rawText }}</button>
+      </div>
+
+      <template v-if="bodyDiff && target">
+        <div v-if="diff.loading" class="as-muted as-diff-wait">{{ text.diffLoading }}</div>
+        <p v-else-if="diff.error" class="as-note as-note--bad">{{ diff.error }}</p>
+        <AuditDiffView
+          v-else
+          :original="diff.original"
+          :modified="diff.modified"
+          :language="diff.language"
+          :note="diff.note"
+          :original-label="target.label"
+          :modified-label="selfLabel"
+        />
+      </template>
+      <template v-else-if="body.sse?.length">
         <AuditBodyView v-if="showRawSSE" :text="body.text || ''" :truncated="body.truncated_for_display" />
-        <ol v-else class="as-events">
+        <ol v-else class="as-events" data-testid="audit-sse-events">
           <li v-for="(ev, i) in visibleEvents" :key="i">
             <span class="as-badge as-badge--muted">{{ ev.event || 'message' }}</span>
+            <span v-if="ev.merged" class="as-badge as-badge--info">{{ text.merged }} ×{{ ev.merged }}</span>
             <code class="as-break">{{ ev.data }}</code>
           </li>
-          <li v-if="body.sse.length > visibleEvents.length">
-            <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ body.sse.length - visibleEvents.length }}</button>
+          <li v-if="mergedEvents.length > visibleEvents.length">
+            <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ mergedEvents.length - visibleEvents.length }}</button>
           </li>
         </ol>
       </template>
@@ -98,12 +147,21 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { downloadBody, saveBlob, type ArchiveKind, type SectionView } from './api'
+import { computed, reactive, ref, watch } from 'vue'
+import { downloadBody, fetchFullBodyText, saveBlob, type ArchiveKind, type SectionView } from './api'
 import AuditBodyView from './AuditBodyView.vue'
+import AuditDiffView from './AuditDiffView.vue'
+import { headersToHTTP, isSSE, prettyJSONRaw, type DiffTarget } from './diffText'
 import { useAuditText } from './i18n'
+import { mergeSSE, parseSSE, renderSSE } from './sse'
 
-const props = defineProps<{ section: SectionView; kind: ArchiveKind; archiveRef: string }>()
+const props = defineProps<{
+  section: SectionView
+  kind: ArchiveKind
+  archiveRef: string
+  /** 差异对比的基底候选（实际上游请求：客户端请求；客户端响应：各次上游响应） */
+  diffTargets?: DiffTarget[]
+}>()
 const text = useAuditText()
 
 const h = computed(() => props.section.header)
@@ -118,7 +176,50 @@ const headerRows = computed<[string, string][]>(() =>
 const metaRows = computed(() => Object.keys(meta.value))
 const showRawSSE = ref(false)
 const eventLimit = ref(500)
-const visibleEvents = computed(() => body.value?.sse?.slice(0, eventLimit.value) ?? [])
+// 「SSE 事件」模式：连续的增量事件合并展示（原文与下载不受影响）
+const mergedEvents = computed(() => mergeSSE(body.value?.sse ?? []))
+const visibleEvents = computed(() => mergedEvents.value.slice(0, eventLimit.value))
+
+// ---- 差异对比 ----
+const isResponse = computed(() => props.kind === 'upstream_response' || props.kind === 'client_response')
+const targetIndex = ref(Math.max(0, (props.diffTargets?.length ?? 1) - 1))
+const target = computed<DiffTarget | undefined>(() => props.diffTargets?.[targetIndex.value])
+const selfLabel = computed(() => `${text.value.files[props.kind]}${props.kind.startsWith('upstream') ? ` #${props.section.seq}` : ''}`)
+const diffTitle = computed(() => (isResponse.value ? text.value.diffTitleResponse : text.value.diffTitleRequest))
+const headerDiff = ref(false)
+const bodyDiff = ref(false)
+const sseDiff = computed(() => bodyDiff.value && !!target.value && (isSSE(h.value) || isSSE(target.value.section.header)))
+const diff = reactive({ loading: false, error: '', original: '', modified: '', language: 'plaintext' as 'json' | 'plaintext', note: '' })
+let diffGen = 0
+
+/** 对比用文本：取完整正文（不受展示截断影响），SSE 跟随展示模式，JSON 按原文排版。 */
+async function loadBodyDiff() {
+  const t = target.value
+  if (!bodyDiff.value || !t) return
+  const gen = ++diffGen
+  diff.loading = true
+  diff.error = ''
+  try {
+    const [base, self] = await Promise.all([
+      fetchFullBodyText(props.archiveRef, t.kind, t.section.index),
+      fetchFullBodyText(props.archiveRef, props.kind, props.section.index)
+    ])
+    if (gen !== diffGen) return
+    if (sseDiff.value) {
+      const shape = (s: string) => (showRawSSE.value ? s : renderSSE(mergeSSE(parseSSE(s)), prettyJSONRaw))
+      Object.assign(diff, { original: shape(base), modified: shape(self), language: 'plaintext', note: showRawSSE.value ? text.value.diffSSERaw : text.value.diffSSEMerged })
+    } else if (/^\s*[[{]/.test(base) || /^\s*[[{]/.test(self)) {
+      Object.assign(diff, { original: prettyJSONRaw(base), modified: prettyJSONRaw(self), language: 'json', note: text.value.diffJSONRaw })
+    } else {
+      Object.assign(diff, { original: base, modified: self, language: 'plaintext', note: '' })
+    }
+  } catch (e) {
+    if (gen === diffGen) diff.error = (e as { message?: string })?.message ?? String(e)
+  } finally {
+    if (gen === diffGen) diff.loading = false
+  }
+}
+watch([bodyDiff, target, showRawSSE], loadBodyDiff)
 const visibleMessages = computed(() => props.section.messages?.slice(0, eventLimit.value) ?? [])
 
 const downloading = ref(false)
@@ -207,6 +308,10 @@ function fmtTime(t?: string) {
   background: rgb(254 243 199);
   color: rgb(146 64 14);
 }
+.as-badge--info {
+  background: rgb(219 234 254);
+  color: rgb(29 78 216);
+}
 .as-badge--muted {
   background: rgb(243 244 246);
   color: rgb(75 85 99);
@@ -270,6 +375,37 @@ function fmtTime(t?: string) {
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+.as-btn--sm {
+  margin-left: 0.4rem;
+  line-height: 1.2rem;
+}
+.as-btn--on {
+  background: rgb(219 234 254);
+  border-color: rgb(147 197 253);
+  color: rgb(29 78 216);
+}
+:global(.dark) .as-btn--on {
+  background: rgb(30 58 138);
+  border-color: rgb(59 130 246);
+  color: rgb(219 234 254);
+}
+.as-select {
+  border: 1px solid rgb(209 213 219);
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  line-height: 1.4rem;
+  padding: 0 0.3rem;
+  background: transparent;
+  color: inherit;
+}
+.as-diff-wait {
+  height: 560px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed rgb(209 213 219);
+  border-radius: 0.375rem;
 }
 .as-btn--link {
   border: none;

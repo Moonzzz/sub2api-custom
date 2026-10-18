@@ -7,8 +7,19 @@
             <strong>{{ text.title }}</strong>
             <span class="aa-muted">· {{ text.usageId }} #{{ usageId }}</span>
           </div>
-          <button type="button" class="aa-btn" @click="emit('close')">{{ text.close }}</button>
+          <div class="aa-head__actions">
+            <button
+              v-if="data?.archive && data.archive.status !== 'missing'"
+              type="button"
+              class="aa-btn"
+              :disabled="bundleBusy"
+              data-testid="audit-download-bundle"
+              @click="downloadWhole"
+            >{{ text.downloadBundle }}</button>
+            <button type="button" class="aa-btn" @click="emit('close')">{{ text.close }}</button>
+          </div>
         </header>
+        <p v-if="bundleError" class="aa-bundle-error">{{ bundleError }}</p>
 
         <div class="aa-body">
           <div v-if="loading" class="aa-state">{{ text.loading }}</div>
@@ -117,28 +128,32 @@
                 </button>
               </nav>
 
-              <section v-if="activeFile" class="aa-file" :data-testid="`audit-file-${activeFile.kind}`">
-                <div class="aa-row aa-muted">
-                  <span class="aa-badge" :class="activeFile.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[activeFile.status] }}</span>
-                  <span>{{ formatBytes(activeFile.raw_size) }}</span>
-                  <span v-if="data.archive.storage" data-testid="audit-storage">
-                    {{ text.storage[data.archive.storage.location] }} ·
-                    {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
-                    <template v-if="data.archive.storage.session_compressed_size">
-                      · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
-                    </template>
-                  </span>
-                  <span v-if="activeFile.error">{{ activeFile.error }}</span>
-                </div>
-                <div v-if="!activeFile.sections.length" class="aa-state">{{ text.noSections }}</div>
-                <AuditSectionPanel
-                  v-for="sec in activeFile.sections"
-                  :key="`${activeFile.kind}-${sec.index}`"
-                  :section="sec"
-                  :kind="activeFile.kind"
-                  :archive-ref="data.archive.ref"
-                />
-              </section>
+              <!-- 访问过的标签保持挂载（v-show）：切换时不重建编辑器，弹窗高度不抖动 -->
+              <template v-for="f in data.archive.files" :key="f.kind">
+                <section v-if="visited.has(f.kind)" v-show="activeKind === f.kind" class="aa-file" :data-testid="`audit-file-${f.kind}`">
+                  <div class="aa-row aa-muted">
+                    <span class="aa-badge" :class="f.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[f.status] }}</span>
+                    <span>{{ formatBytes(f.raw_size) }}</span>
+                    <span v-if="data.archive.storage" data-testid="audit-storage">
+                      {{ text.storage[data.archive.storage.location] }} ·
+                      {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
+                      <template v-if="data.archive.storage.session_compressed_size">
+                        · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
+                      </template>
+                    </span>
+                    <span v-if="f.error">{{ f.error }}</span>
+                  </div>
+                  <div v-if="!f.sections.length" class="aa-state">{{ text.noSections }}</div>
+                  <AuditSectionPanel
+                    v-for="sec in f.sections"
+                    :key="`${f.kind}-${sec.index}`"
+                    :section="sec"
+                    :kind="f.kind"
+                    :archive-ref="data.archive.ref"
+                    :diff-targets="diffTargets[f.kind]"
+                  />
+                </section>
+              </template>
             </template>
           </template>
         </div>
@@ -151,7 +166,8 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AuditSectionPanel from './AuditSectionPanel.vue'
-import { fetchUsageArchive, type ApiError, type ArchiveKind, type UsageArchiveResponse } from './api'
+import { downloadBundle, fetchUsageArchive, saveBlob, type ApiError, type ArchiveKind, type UsageArchiveResponse } from './api'
+import type { DiffTarget } from './diffText'
 import { formatBytes, useAuditText } from './i18n'
 
 const props = defineProps<{ usageId: number }>()
@@ -169,7 +185,36 @@ let generation = 0
 
 const s = computed<Record<string, any>>(() => data.value?.archive?.summary ?? {})
 const usageNotes = computed<Record<string, any>[]>(() => (s.value.usage_notes as Record<string, any>[] | undefined) ?? [])
-const activeFile = computed(() => data.value?.archive?.files.find((f) => f.kind === activeKind.value))
+const visited = ref(new Set<ArchiveKind>(['client_request']))
+watch(activeKind, (k) => visited.value.add(k))
+
+// 差异对比的基底：实际上游请求 ← 客户端请求；客户端响应 ← 各次上游响应（默认最后一次）。
+const diffTargets = computed<Partial<Record<ArchiveKind, DiffTarget[]>>>(() => {
+  const files = data.value?.archive?.files ?? []
+  const byKind = (k: ArchiveKind) => files.find((f) => f.kind === k)?.sections ?? []
+  const clientReq = byKind('client_request')
+  return {
+    upstream_request: clientReq.length ? [{ label: text.value.files.client_request, kind: 'client_request', section: clientReq[0] }] : undefined,
+    client_response: byKind('upstream_response').map((sec) => ({ label: `${text.value.files.upstream_response} #${sec.seq}`, kind: 'upstream_response' as ArchiveKind, section: sec }))
+  }
+})
+
+const bundleBusy = ref(false)
+const bundleError = ref('')
+async function downloadWhole() {
+  const ref = data.value?.archive?.ref
+  if (!ref) return
+  bundleBusy.value = true
+  bundleError.value = ''
+  try {
+    const res = await downloadBundle(ref)
+    saveBlob(res.blob, res.filename)
+  } catch (e) {
+    bundleError.value = (e as { message?: string })?.message ?? String(e)
+  } finally {
+    bundleBusy.value = false
+  }
+}
 
 function statusText(st: string) {
   return (
@@ -200,6 +245,7 @@ async function load(ref?: string) {
     if (gen !== generation || resp.usage?.id !== props.usageId) return
     data.value = resp
     currentRef.value = resp.ref
+    visited.value = new Set<ArchiveKind>([activeKind.value])
   } catch (e) {
     if (gen !== generation) return
     const err = e as ApiError & { code?: string }
@@ -241,6 +287,8 @@ watch(() => route.fullPath, () => emit('close'))
 }
 .aa-dialog {
   width: min(1100px, 100%);
+  /* 固定高度：切换标签、编辑器加载时内容高度变化只在弹窗内部滚动，不再撑开 / 收缩弹窗 */
+  height: calc(100vh - 2rem);
   max-height: calc(100vh - 2rem);
   display: flex;
   flex-direction: column;
@@ -272,8 +320,22 @@ watch(() => route.fullPath, () => emit('close'))
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.aa-head__actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+.aa-bundle-error {
+  margin: 0;
+  padding: 0.3rem 1rem;
+  color: rgb(185 28 28);
+  font-size: 0.75rem;
+}
 .aa-body {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
   padding: 0.75rem 1rem 1rem;
   display: flex;
   flex-direction: column;

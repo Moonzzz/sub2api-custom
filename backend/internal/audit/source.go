@@ -216,24 +216,40 @@ func (s *Store) WriteRequestBundle(w io.Writer, ref string) (StorageInfo, error)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return StorageInfo{Location: LocationActive, Status: "error", Error: err.Error()}, err
 	}
-	enc, err := zstd.NewWriter(w, encoderOptions(s.cfg.EncoderLevel, s.cfg.ActiveWindowMB, true)...)
-	if err != nil {
-		return StorageInfo{}, err
-	}
-	if _, err := enc.Write([]byte(requestMagic)); err != nil {
-		_ = enc.Close()
-		return StorageInfo{}, err
-	}
+	// 编码器在找到目标请求后才创建：请求不存在时不向 w 写任何字节，调用方仍可返回 404。
+	var enc *zstd.Encoder
 	var werr error
+	start := func() bool {
+		if enc != nil {
+			return true
+		}
+		enc, werr = zstd.NewWriter(w, encoderOptions(s.cfg.EncoderLevel, s.cfg.ActiveWindowMB, true)...)
+		if werr == nil {
+			_, werr = enc.Write([]byte(requestMagic))
+		}
+		return werr == nil
+	}
 	hdr := make([]byte, 0, frameHeaderSize)
 	info, err := s.walkArchive(ref, func(f frame) bool {
+		if !start() {
+			return false
+		}
 		hdr = encodeFrameHeader(hdr[:0], f.typ, f.kind, f.seq, len(f.payload))
 		if _, werr = enc.Write(hdr); werr == nil {
 			_, werr = enc.Write(f.payload)
 		}
 		return werr == nil
 	})
-	cerr := enc.Close()
+	if errors.Is(err, errRequestNotFound) {
+		return info, err
+	}
+	if werr == nil && enc == nil {
+		start() // 条目存在但没有帧（例如归档前即为空文件）：输出只含魔数的流
+	}
+	var cerr error
+	if enc != nil {
+		cerr = enc.Close()
+	}
 	if werr != nil {
 		return info, werr
 	}

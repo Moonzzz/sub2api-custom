@@ -90,7 +90,24 @@ const zh = {
   copyFailed: '复制失败，请手动选择文本复制',
   wrapLines: '自动换行',
   expandAll: '全部展开',
-  collapseAll: '全部折叠'
+  collapseAll: '全部折叠',
+  diff: '差异',
+  diffExit: '退出差异',
+  diffTitleRequest: '以客户端请求为基底，对比实际上游请求',
+  diffTitleResponse: '以上游响应为基底，对比客户端响应',
+  diffBase: '基底',
+  diffTarget: '对比',
+  diffLoading: '正在读取完整正文…',
+  diffSideBySide: '并排',
+  diffInline: '合并',
+  diffHideUnchanged: '折叠相同内容',
+  diffNone: '无差异',
+  diffChanges: '处差异',
+  diffSSEMerged: 'SSE 事件按合并后的结果对比',
+  diffSSERaw: 'SSE 按原文对比',
+  diffJSONRaw: 'JSON 已按原文排版（转义与数字写法逐字保留）',
+  merged: '合并',
+  downloadBundle: '下载整个请求'
 }
 
 type Dict = typeof zh
@@ -185,7 +202,24 @@ const en: Dict = {
   copyFailed: 'Copy failed; select the text and copy manually',
   wrapLines: 'Wrap lines',
   expandAll: 'Expand all',
-  collapseAll: 'Collapse all'
+  collapseAll: 'Collapse all',
+  diff: 'Diff',
+  diffExit: 'Exit diff',
+  diffTitleRequest: 'Client request (base) vs actual upstream request',
+  diffTitleResponse: 'Upstream response (base) vs client response',
+  diffBase: 'Base',
+  diffTarget: 'Compared',
+  diffLoading: 'Loading full bodies…',
+  diffSideBySide: 'Side by side',
+  diffInline: 'Inline',
+  diffHideUnchanged: 'Collapse unchanged',
+  diffNone: 'No differences',
+  diffChanges: 'changes',
+  diffSSEMerged: 'SSE compared after merging events',
+  diffSSERaw: 'SSE compared as raw text',
+  diffJSONRaw: 'JSON laid out from the raw text (escapes and number literals kept)',
+  merged: 'merged',
+  downloadBundle: 'Download whole request'
 }
 
 export function useAuditText() {

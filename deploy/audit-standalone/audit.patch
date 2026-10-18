@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/main.go b/backend/cmd/server/main.go
-index 8494713b..2f604ade 100644
+index 8494713ba..2f604adeb 100644
 --- a/backend/cmd/server/main.go
 +++ b/backend/cmd/server/main.go
 @@ -16,6 +16,7 @@ import (
@@ -33,7 +33,7 @@ index 8494713b..2f604ade 100644
  	log.Println("Server exited")
  }
 diff --git a/backend/go.mod b/backend/go.mod
-index 2e68ebc9..63b7707d 100644
+index 2e68ebc9a..63b7707d7 100644
 --- a/backend/go.mod
 +++ b/backend/go.mod
 @@ -50,6 +50,8 @@ require (
@@ -57,17 +57,19 @@ index 2e68ebc9..63b7707d 100644
  	go.uber.org/multierr v1.9.0 // indirect
 diff --git a/backend/internal/audit/api.go b/backend/internal/audit/api.go
 new file mode 100644
-index 00000000..1f847aad
+index 000000000..87568953a
 --- /dev/null
 +++ b/backend/internal/audit/api.go
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,427 @@
 +package audit
 +
 +import (
++	"archive/zip"
 +	"context"
 +	"errors"
 +	"fmt"
 +	"io"
++	"log/slog"
 +	"net/http"
 +	"path"
 +	"strconv"
@@ -338,7 +340,11 @@ index 00000000..1f847aad
 +	_, err = s.StreamBody(c.Writer, ref, kind, index, decode, func(info BodyInfo) {
 +		started = true
 +		h := info.Header
-+		name := fmt.Sprintf("%s-%s-%d.bin", path.Base(ref), kind, index)
++		suffix := ""
++		if decode {
++			suffix = "-decoded"
++		}
++		name := fmt.Sprintf("%s-%s-%d%s%s", path.Base(ref), kind, index, suffix, bodyFileExt(h.Header, decode))
 +		c.Header("Content-Type", "application/octet-stream")
 +		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 +		c.Header("X-Content-Type-Options", "nosniff")
@@ -368,8 +374,36 @@ index 00000000..1f847aad
 +	}
 +}
 +
-+// handleBundle 下载一个请求的全部阶段（单个 zstd 流，格式同 active 请求文件）。
-+// 四个阶段共用一次压缩，适合整体传输；请求仍在 active 时直接发送文件字节，不重新压缩。
++// bodyFileExt 按正文类型给下载文件后缀：保留原始压缩字节时按 Content-Encoding；
++// 否则 JSON 与 SSE 为 .json，其它文本为 .txt，识别不了的为 .bin。
++func bodyFileExt(h map[string][]string, decoded bool) string {
++	enc := strings.ToLower(strings.TrimSpace(headerValue(h, "Content-Encoding")))
++	if !decoded && enc != "" && enc != "identity" {
++		switch enc {
++		case "gzip", "x-gzip":
++			return ".gz"
++		case "br":
++			return ".br"
++		case "zstd":
++			return ".zst"
++		case "deflate":
++			return ".deflate"
++		}
++		return ".bin"
++	}
++	ct := strings.ToLower(headerValue(h, "Content-Type"))
++	switch {
++	case strings.Contains(ct, "json"), strings.HasPrefix(ct, "text/event-stream"):
++		return ".json"
++	case strings.HasPrefix(ct, "text/"):
++		return ".txt"
++	}
++	return ".bin"
++}
++
++// handleBundle 下载整个请求：zip 内只有一个文件 {请求}.zst，即该请求的存档数据原样
++// （四个阶段共用一条 zstd 流，格式同 active 请求文件；已归档的请求从会话归档中还原为同格式）。
++// zip 条目使用 Store（.zst 已压缩，不再二次压缩）。
 +func handleBundle(c *gin.Context) {
 +	s := storeOr503(c)
 +	if s == nil {
@@ -380,36 +414,57 @@ index 00000000..1f847aad
 +		response.BadRequest(c, "invalid ref")
 +		return
 +	}
-+	cw := &lazyHeaderWriter{w: c.Writer, onFirst: func() {
-+		c.Header("Content-Type", "application/zstd")
-+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(ref)+".zst"))
++	base := path.Base(ref)
++	var zw *zip.Writer
++	entry := &lazyHeaderWriter{onFirst: func() (io.Writer, error) {
++		c.Header("Content-Type", "application/zip")
++		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", base+".zip"))
 +		c.Header("X-Content-Type-Options", "nosniff")
 +		c.Header("Cache-Control", "private, no-store")
 +		c.Status(http.StatusOK)
++		zw = zip.NewWriter(c.Writer)
++		return zw.CreateHeader(&zip.FileHeader{Name: base + ".zst", Method: zip.Store, Modified: time.Now()})
 +	}}
-+	info, err := s.WriteRequestBundle(cw, ref)
-+	if err != nil && !cw.started {
++	_, err := s.WriteRequestBundle(entry, ref)
++	if !entry.started {
 +		if errors.Is(err, errRequestNotFound) {
 +			response.NotFound(c, "archive not found")
 +			return
 +		}
-+		response.InternalError(c, "archive read failed: "+err.Error())
++		msg := "empty archive"
++		if err != nil {
++			msg = err.Error()
++		}
++		response.InternalError(c, "archive read failed: "+msg)
 +		return
 +	}
-+	_ = info
++	if err != nil {
++		// 响应头已发出：不写 zip 目录，客户端得到的是无法解开的不完整文件，而不是“看似完整”的文件。
++		slog.Warn("audit_bundle_stream_failed", "ref", ref, "error", err)
++		return
++	}
++	_ = zw.Close()
 +}
 +
-+// lazyHeaderWriter 在第一次写入时才发送响应头，便于出错时仍能返回 JSON 错误。
++// lazyHeaderWriter 在第一次写入时才发送响应头并取得真正的写入目标，
++// 便于读取失败（例如请求不存在）时仍能返回 JSON 错误。
 +type lazyHeaderWriter struct {
 +	w       io.Writer
-+	onFirst func()
++	onFirst func() (io.Writer, error)
 +	started bool
 +}
 +
 +func (l *lazyHeaderWriter) Write(p []byte) (int, error) {
 +	if !l.started {
 +		l.started = true
-+		l.onFirst()
++		w, err := l.onFirst()
++		if err != nil {
++			return 0, err
++		}
++		l.w = w
++	}
++	if l.w == nil {
++		return 0, io.ErrClosedPipe
 +	}
 +	return l.w.Write(p)
 +}
@@ -435,7 +490,7 @@ index 00000000..1f847aad
 +var errSectionNotFound = errors.New("audit: section not found")
 diff --git a/backend/internal/audit/archive.go b/backend/internal/audit/archive.go
 new file mode 100644
-index 00000000..85fa6171
+index 000000000..85fa61719
 --- /dev/null
 +++ b/backend/internal/audit/archive.go
 @@ -0,0 +1,347 @@
@@ -788,7 +843,7 @@ index 00000000..85fa6171
 +var jsonUnmarshal = json.Unmarshal
 diff --git a/backend/internal/audit/archiver.go b/backend/internal/audit/archiver.go
 new file mode 100644
-index 00000000..e2970dba
+index 000000000..e2970dbae
 --- /dev/null
 +++ b/backend/internal/audit/archiver.go
 @@ -0,0 +1,514 @@
@@ -1308,7 +1363,7 @@ index 00000000..e2970dba
 +}
 diff --git a/backend/internal/audit/config.go b/backend/internal/audit/config.go
 new file mode 100644
-index 00000000..68c957e2
+index 000000000..68c957e2d
 --- /dev/null
 +++ b/backend/internal/audit/config.go
 @@ -0,0 +1,205 @@
@@ -1519,7 +1574,7 @@ index 00000000..68c957e2
 +}
 diff --git a/backend/internal/audit/file.go b/backend/internal/audit/file.go
 new file mode 100644
-index 00000000..95e8c5b9
+index 000000000..95e8c5b9d
 --- /dev/null
 +++ b/backend/internal/audit/file.go
 @@ -0,0 +1,242 @@
@@ -1767,7 +1822,7 @@ index 00000000..95e8c5b9
 +}
 diff --git a/backend/internal/audit/format.go b/backend/internal/audit/format.go
 new file mode 100644
-index 00000000..40ff05f7
+index 000000000..40ff05f74
 --- /dev/null
 +++ b/backend/internal/audit/format.go
 @@ -0,0 +1,135 @@
@@ -1908,7 +1963,7 @@ index 00000000..40ff05f7
 +)
 diff --git a/backend/internal/audit/gin.go b/backend/internal/audit/gin.go
 new file mode 100644
-index 00000000..ee0cac06
+index 000000000..ee0cac06c
 --- /dev/null
 +++ b/backend/internal/audit/gin.go
 @@ -0,0 +1,357 @@
@@ -2271,7 +2326,7 @@ index 00000000..ee0cac06
 +}
 diff --git a/backend/internal/audit/locks.go b/backend/internal/audit/locks.go
 new file mode 100644
-index 00000000..cb33d97c
+index 000000000..cb33d97c8
 --- /dev/null
 +++ b/backend/internal/audit/locks.go
 @@ -0,0 +1,68 @@
@@ -2345,7 +2400,7 @@ index 00000000..cb33d97c
 +}
 diff --git a/backend/internal/audit/reader.go b/backend/internal/audit/reader.go
 new file mode 100644
-index 00000000..d16658b8
+index 000000000..d16658b81
 --- /dev/null
 +++ b/backend/internal/audit/reader.go
 @@ -0,0 +1,437 @@
@@ -2788,7 +2843,7 @@ index 00000000..d16658b8
 +}
 diff --git a/backend/internal/audit/recorder.go b/backend/internal/audit/recorder.go
 new file mode 100644
-index 00000000..6938b078
+index 000000000..6938b0786
 --- /dev/null
 +++ b/backend/internal/audit/recorder.go
 @@ -0,0 +1,291 @@
@@ -3085,7 +3140,7 @@ index 00000000..6938b078
 +func (r *Recorder) Finished() bool { return r == nil || r.finished.Load() }
 diff --git a/backend/internal/audit/redact.go b/backend/internal/audit/redact.go
 new file mode 100644
-index 00000000..d1941088
+index 000000000..d19410882
 --- /dev/null
 +++ b/backend/internal/audit/redact.go
 @@ -0,0 +1,128 @@
@@ -3219,7 +3274,7 @@ index 00000000..d1941088
 +}
 diff --git a/backend/internal/audit/session.go b/backend/internal/audit/session.go
 new file mode 100644
-index 00000000..c737b5f6
+index 000000000..c737b5f60
 --- /dev/null
 +++ b/backend/internal/audit/session.go
 @@ -0,0 +1,179 @@
@@ -3404,10 +3459,10 @@ index 00000000..c737b5f6
 +}
 diff --git a/backend/internal/audit/source.go b/backend/internal/audit/source.go
 new file mode 100644
-index 00000000..c210c96b
+index 000000000..e63d2c9ed
 --- /dev/null
 +++ b/backend/internal/audit/source.go
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,263 @@
 +package audit
 +
 +import (
@@ -3626,24 +3681,40 @@ index 00000000..c210c96b
 +	} else if !errors.Is(err, fs.ErrNotExist) {
 +		return StorageInfo{Location: LocationActive, Status: "error", Error: err.Error()}, err
 +	}
-+	enc, err := zstd.NewWriter(w, encoderOptions(s.cfg.EncoderLevel, s.cfg.ActiveWindowMB, true)...)
-+	if err != nil {
-+		return StorageInfo{}, err
-+	}
-+	if _, err := enc.Write([]byte(requestMagic)); err != nil {
-+		_ = enc.Close()
-+		return StorageInfo{}, err
-+	}
++	// 编码器在找到目标请求后才创建：请求不存在时不向 w 写任何字节，调用方仍可返回 404。
++	var enc *zstd.Encoder
 +	var werr error
++	start := func() bool {
++		if enc != nil {
++			return true
++		}
++		enc, werr = zstd.NewWriter(w, encoderOptions(s.cfg.EncoderLevel, s.cfg.ActiveWindowMB, true)...)
++		if werr == nil {
++			_, werr = enc.Write([]byte(requestMagic))
++		}
++		return werr == nil
++	}
 +	hdr := make([]byte, 0, frameHeaderSize)
 +	info, err := s.walkArchive(ref, func(f frame) bool {
++		if !start() {
++			return false
++		}
 +		hdr = encodeFrameHeader(hdr[:0], f.typ, f.kind, f.seq, len(f.payload))
 +		if _, werr = enc.Write(hdr); werr == nil {
 +			_, werr = enc.Write(f.payload)
 +		}
 +		return werr == nil
 +	})
-+	cerr := enc.Close()
++	if errors.Is(err, errRequestNotFound) {
++		return info, err
++	}
++	if werr == nil && enc == nil {
++		start() // 条目存在但没有帧（例如归档前即为空文件）：输出只含魔数的流
++	}
++	var cerr error
++	if enc != nil {
++		cerr = enc.Close()
++	}
 +	if werr != nil {
 +		return info, werr
 +	}
@@ -3657,7 +3728,7 @@ index 00000000..c210c96b
 +}
 diff --git a/backend/internal/audit/store.go b/backend/internal/audit/store.go
 new file mode 100644
-index 00000000..0a0f04a2
+index 000000000..0a0f04a29
 --- /dev/null
 +++ b/backend/internal/audit/store.go
 @@ -0,0 +1,340 @@
@@ -4003,7 +4074,7 @@ index 00000000..0a0f04a2
 +}
 diff --git a/backend/internal/audit/trace.go b/backend/internal/audit/trace.go
 new file mode 100644
-index 00000000..10511522
+index 000000000..105115229
 --- /dev/null
 +++ b/backend/internal/audit/trace.go
 @@ -0,0 +1,41 @@
@@ -4050,7 +4121,7 @@ index 00000000..10511522
 +}
 diff --git a/backend/internal/audit/transport.go b/backend/internal/audit/transport.go
 new file mode 100644
-index 00000000..648447c9
+index 000000000..648447c90
 --- /dev/null
 +++ b/backend/internal/audit/transport.go
 @@ -0,0 +1,297 @@
@@ -4353,7 +4424,7 @@ index 00000000..648447c9
 +}
 diff --git a/backend/internal/audit/usage.go b/backend/internal/audit/usage.go
 new file mode 100644
-index 00000000..b669d76e
+index 000000000..b669d76e3
 --- /dev/null
 +++ b/backend/internal/audit/usage.go
 @@ -0,0 +1,91 @@
@@ -4450,7 +4521,7 @@ index 00000000..b669d76e
 +}
 diff --git a/backend/internal/audit/ws.go b/backend/internal/audit/ws.go
 new file mode 100644
-index 00000000..96d241b6
+index 000000000..96d241b66
 --- /dev/null
 +++ b/backend/internal/audit/ws.go
 @@ -0,0 +1,112 @@
@@ -4568,7 +4639,7 @@ index 00000000..96d241b6
 +}
 diff --git a/backend/internal/audit/wsraw.go b/backend/internal/audit/wsraw.go
 new file mode 100644
-index 00000000..f75577ac
+index 000000000..f75577ac6
 --- /dev/null
 +++ b/backend/internal/audit/wsraw.go
 @@ -0,0 +1,184 @@
@@ -4758,7 +4829,7 @@ index 00000000..f75577ac
 +}
 diff --git a/backend/internal/handler/admin/usage_audit_archive.go b/backend/internal/handler/admin/usage_audit_archive.go
 new file mode 100644
-index 00000000..ce23276f
+index 000000000..ce23276f7
 --- /dev/null
 +++ b/backend/internal/handler/admin/usage_audit_archive.go
 @@ -0,0 +1,36 @@
@@ -4799,7 +4870,7 @@ index 00000000..ce23276f
 +	}
 +}
 diff --git a/backend/internal/repository/http_upstream.go b/backend/internal/repository/http_upstream.go
-index ff19b03d..15ee572f 100644
+index ff19b03d8..15ee572f1 100644
 --- a/backend/internal/repository/http_upstream.go
 +++ b/backend/internal/repository/http_upstream.go
 @@ -26,6 +26,7 @@ import (
@@ -4828,7 +4899,7 @@ index ff19b03d..15ee572f 100644
  	if err != nil {
 diff --git a/backend/internal/repository/usage_log_audit_hook.go b/backend/internal/repository/usage_log_audit_hook.go
 new file mode 100644
-index 00000000..d6d6723b
+index 000000000..d6d6723b7
 --- /dev/null
 +++ b/backend/internal/repository/usage_log_audit_hook.go
 @@ -0,0 +1,26 @@
@@ -4859,7 +4930,7 @@ index 00000000..d6d6723b
 +	})
 +}
 diff --git a/backend/internal/repository/usage_log_repo_insert.go b/backend/internal/repository/usage_log_repo_insert.go
-index e004433f..fe9914ee 100644
+index e004433f3..fe9914ee8 100644
 --- a/backend/internal/repository/usage_log_repo_insert.go
 +++ b/backend/internal/repository/usage_log_repo_insert.go
 @@ -150,10 +150,11 @@ const (
@@ -4890,7 +4961,7 @@ index e004433f..fe9914ee 100644
  	if tx := dbent.TxFromContext(ctx); tx != nil {
  		_, err := r.createSingle(ctx, tx.Client(), log)
 diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
-index 315fc20e..9ad827b0 100644
+index 315fc20e4..9ad827b08 100644
 --- a/backend/internal/server/routes/admin.go
 +++ b/backend/internal/server/routes/admin.go
 @@ -94,6 +94,9 @@ func RegisterAdminRoutes(
@@ -4905,7 +4976,7 @@ index 315fc20e..9ad827b0 100644
  
 diff --git a/backend/internal/server/routes/audit_archive.go b/backend/internal/server/routes/audit_archive.go
 new file mode 100644
-index 00000000..278e7a5b
+index 000000000..278e7a5b8
 --- /dev/null
 +++ b/backend/internal/server/routes/audit_archive.go
 @@ -0,0 +1,46 @@
@@ -4956,7 +5027,7 @@ index 00000000..278e7a5b
 +	audit.RegisterRoutes(admin, lookup)
 +}
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 3f09ebf4..3c96ecf8 100644
+index 3f09ebf40..3c96ecf80 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -32,7 +32,7 @@ func RegisterGatewayRoutes(
@@ -4969,7 +5040,7 @@ index 3f09ebf4..3c96ecf8 100644
  	endpointNorm := handler.InboundEndpointMiddleware()
  	compositeTarget := compositeTargetPlatformMiddleware(compositeResolver)
 diff --git a/backend/internal/service/openai_ws_client.go b/backend/internal/service/openai_ws_client.go
-index 7444e41d..33f6ed31 100644
+index 7444e41d0..33f6ed315 100644
 --- a/backend/internal/service/openai_ws_client.go
 +++ b/backend/internal/service/openai_ws_client.go
 @@ -1,7 +1,9 @@
@@ -5090,14 +5161,14 @@ index 7444e41d..33f6ed31 100644
  }
 diff --git a/frontend-audit/.gitignore b/frontend-audit/.gitignore
 new file mode 100644
-index 00000000..3c3629e6
+index 000000000..3c3629e64
 --- /dev/null
 +++ b/frontend-audit/.gitignore
 @@ -0,0 +1 @@
 +node_modules
 diff --git a/frontend-audit/build.sh b/frontend-audit/build.sh
 new file mode 100755
-index 00000000..35239455
+index 000000000..35239455d
 --- /dev/null
 +++ b/frontend-audit/build.sh
 @@ -0,0 +1,31 @@
@@ -5134,7 +5205,7 @@ index 00000000..35239455
 +echo "audit-ui build OK -> $dist"
 diff --git a/frontend-audit/deps/alias.mjs b/frontend-audit/deps/alias.mjs
 new file mode 100644
-index 00000000..4ca7ec32
+index 000000000..4ca7ec32b
 --- /dev/null
 +++ b/frontend-audit/deps/alias.mjs
 @@ -0,0 +1,14 @@
@@ -5154,7 +5225,7 @@ index 00000000..4ca7ec32
 +}
 diff --git a/frontend-audit/deps/package.json b/frontend-audit/deps/package.json
 new file mode 100644
-index 00000000..01f4d95f
+index 000000000..01f4d95f1
 --- /dev/null
 +++ b/frontend-audit/deps/package.json
 @@ -0,0 +1,8 @@
@@ -5168,7 +5239,7 @@ index 00000000..01f4d95f
 +}
 diff --git a/frontend-audit/deps/pnpm-lock.yaml b/frontend-audit/deps/pnpm-lock.yaml
 new file mode 100644
-index 00000000..a5285beb
+index 000000000..a5285bebf
 --- /dev/null
 +++ b/frontend-audit/deps/pnpm-lock.yaml
 @@ -0,0 +1,45 @@
@@ -5219,7 +5290,7 @@ index 00000000..a5285beb
 +      marked: 14.0.0
 diff --git a/frontend-audit/plugin/usageTablePatch.mjs b/frontend-audit/plugin/usageTablePatch.mjs
 new file mode 100644
-index 00000000..fef53b07
+index 000000000..fef53b07a
 --- /dev/null
 +++ b/frontend-audit/plugin/usageTablePatch.mjs
 @@ -0,0 +1,59 @@
@@ -5284,7 +5355,7 @@ index 00000000..fef53b07
 +}
 diff --git a/frontend-audit/src/AuditArchiveEntry.vue b/frontend-audit/src/AuditArchiveEntry.vue
 new file mode 100644
-index 00000000..ed7001be
+index 000000000..ed7001be7
 --- /dev/null
 +++ b/frontend-audit/src/AuditArchiveEntry.vue
 @@ -0,0 +1,64 @@
@@ -5354,10 +5425,10 @@ index 00000000..ed7001be
 +</style>
 diff --git a/frontend-audit/src/AuditArchiveModal.vue b/frontend-audit/src/AuditArchiveModal.vue
 new file mode 100644
-index 00000000..e6847b2f
+index 000000000..8ff886d89
 --- /dev/null
 +++ b/frontend-audit/src/AuditArchiveModal.vue
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,537 @@
 +<template>
 +  <Teleport to="body">
 +    <div class="aa-overlay" data-testid="audit-archive-modal" @click.self="emit('close')">
@@ -5367,8 +5438,19 @@ index 00000000..e6847b2f
 +            <strong>{{ text.title }}</strong>
 +            <span class="aa-muted">· {{ text.usageId }} #{{ usageId }}</span>
 +          </div>
-+          <button type="button" class="aa-btn" @click="emit('close')">{{ text.close }}</button>
++          <div class="aa-head__actions">
++            <button
++              v-if="data?.archive && data.archive.status !== 'missing'"
++              type="button"
++              class="aa-btn"
++              :disabled="bundleBusy"
++              data-testid="audit-download-bundle"
++              @click="downloadWhole"
++            >{{ text.downloadBundle }}</button>
++            <button type="button" class="aa-btn" @click="emit('close')">{{ text.close }}</button>
++          </div>
 +        </header>
++        <p v-if="bundleError" class="aa-bundle-error">{{ bundleError }}</p>
 +
 +        <div class="aa-body">
 +          <div v-if="loading" class="aa-state">{{ text.loading }}</div>
@@ -5477,28 +5559,32 @@ index 00000000..e6847b2f
 +                </button>
 +              </nav>
 +
-+              <section v-if="activeFile" class="aa-file" :data-testid="`audit-file-${activeFile.kind}`">
-+                <div class="aa-row aa-muted">
-+                  <span class="aa-badge" :class="activeFile.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[activeFile.status] }}</span>
-+                  <span>{{ formatBytes(activeFile.raw_size) }}</span>
-+                  <span v-if="data.archive.storage" data-testid="audit-storage">
-+                    {{ text.storage[data.archive.storage.location] }} ·
-+                    {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
-+                    <template v-if="data.archive.storage.session_compressed_size">
-+                      · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
-+                    </template>
-+                  </span>
-+                  <span v-if="activeFile.error">{{ activeFile.error }}</span>
-+                </div>
-+                <div v-if="!activeFile.sections.length" class="aa-state">{{ text.noSections }}</div>
-+                <AuditSectionPanel
-+                  v-for="sec in activeFile.sections"
-+                  :key="`${activeFile.kind}-${sec.index}`"
-+                  :section="sec"
-+                  :kind="activeFile.kind"
-+                  :archive-ref="data.archive.ref"
-+                />
-+              </section>
++              <!-- 访问过的标签保持挂载（v-show）：切换时不重建编辑器，弹窗高度不抖动 -->
++              <template v-for="f in data.archive.files" :key="f.kind">
++                <section v-if="visited.has(f.kind)" v-show="activeKind === f.kind" class="aa-file" :data-testid="`audit-file-${f.kind}`">
++                  <div class="aa-row aa-muted">
++                    <span class="aa-badge" :class="f.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[f.status] }}</span>
++                    <span>{{ formatBytes(f.raw_size) }}</span>
++                    <span v-if="data.archive.storage" data-testid="audit-storage">
++                      {{ text.storage[data.archive.storage.location] }} ·
++                      {{ text.requestSize }} zstd {{ formatBytes(data.archive.storage.compressed_size) }} → {{ formatBytes(data.archive.storage.raw_size) }}
++                      <template v-if="data.archive.storage.session_compressed_size">
++                        · {{ text.sessionSize }} {{ formatBytes(data.archive.storage.session_compressed_size) }}
++                      </template>
++                    </span>
++                    <span v-if="f.error">{{ f.error }}</span>
++                  </div>
++                  <div v-if="!f.sections.length" class="aa-state">{{ text.noSections }}</div>
++                  <AuditSectionPanel
++                    v-for="sec in f.sections"
++                    :key="`${f.kind}-${sec.index}`"
++                    :section="sec"
++                    :kind="f.kind"
++                    :archive-ref="data.archive.ref"
++                    :diff-targets="diffTargets[f.kind]"
++                  />
++                </section>
++              </template>
 +            </template>
 +          </template>
 +        </div>
@@ -5511,7 +5597,8 @@ index 00000000..e6847b2f
 +import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 +import { useRoute } from 'vue-router'
 +import AuditSectionPanel from './AuditSectionPanel.vue'
-+import { fetchUsageArchive, type ApiError, type ArchiveKind, type UsageArchiveResponse } from './api'
++import { downloadBundle, fetchUsageArchive, saveBlob, type ApiError, type ArchiveKind, type UsageArchiveResponse } from './api'
++import type { DiffTarget } from './diffText'
 +import { formatBytes, useAuditText } from './i18n'
 +
 +const props = defineProps<{ usageId: number }>()
@@ -5529,7 +5616,36 @@ index 00000000..e6847b2f
 +
 +const s = computed<Record<string, any>>(() => data.value?.archive?.summary ?? {})
 +const usageNotes = computed<Record<string, any>[]>(() => (s.value.usage_notes as Record<string, any>[] | undefined) ?? [])
-+const activeFile = computed(() => data.value?.archive?.files.find((f) => f.kind === activeKind.value))
++const visited = ref(new Set<ArchiveKind>(['client_request']))
++watch(activeKind, (k) => visited.value.add(k))
++
++// 差异对比的基底：实际上游请求 ← 客户端请求；客户端响应 ← 各次上游响应（默认最后一次）。
++const diffTargets = computed<Partial<Record<ArchiveKind, DiffTarget[]>>>(() => {
++  const files = data.value?.archive?.files ?? []
++  const byKind = (k: ArchiveKind) => files.find((f) => f.kind === k)?.sections ?? []
++  const clientReq = byKind('client_request')
++  return {
++    upstream_request: clientReq.length ? [{ label: text.value.files.client_request, kind: 'client_request', section: clientReq[0] }] : undefined,
++    client_response: byKind('upstream_response').map((sec) => ({ label: `${text.value.files.upstream_response} #${sec.seq}`, kind: 'upstream_response' as ArchiveKind, section: sec }))
++  }
++})
++
++const bundleBusy = ref(false)
++const bundleError = ref('')
++async function downloadWhole() {
++  const ref = data.value?.archive?.ref
++  if (!ref) return
++  bundleBusy.value = true
++  bundleError.value = ''
++  try {
++    const res = await downloadBundle(ref)
++    saveBlob(res.blob, res.filename)
++  } catch (e) {
++    bundleError.value = (e as { message?: string })?.message ?? String(e)
++  } finally {
++    bundleBusy.value = false
++  }
++}
 +
 +function statusText(st: string) {
 +  return (
@@ -5560,6 +5676,7 @@ index 00000000..e6847b2f
 +    if (gen !== generation || resp.usage?.id !== props.usageId) return
 +    data.value = resp
 +    currentRef.value = resp.ref
++    visited.value = new Set<ArchiveKind>([activeKind.value])
 +  } catch (e) {
 +    if (gen !== generation) return
 +    const err = e as ApiError & { code?: string }
@@ -5601,6 +5718,8 @@ index 00000000..e6847b2f
 +}
 +.aa-dialog {
 +  width: min(1100px, 100%);
++  /* 固定高度：切换标签、编辑器加载时内容高度变化只在弹窗内部滚动，不再撑开 / 收缩弹窗 */
++  height: calc(100vh - 2rem);
 +  max-height: calc(100vh - 2rem);
 +  display: flex;
 +  flex-direction: column;
@@ -5632,8 +5751,22 @@ index 00000000..e6847b2f
 +  text-overflow: ellipsis;
 +  white-space: nowrap;
 +}
++.aa-head__actions {
++  display: flex;
++  gap: 0.4rem;
++  flex-shrink: 0;
++}
++.aa-bundle-error {
++  margin: 0;
++  padding: 0.3rem 1rem;
++  color: rgb(185 28 28);
++  font-size: 0.75rem;
++}
 +.aa-body {
++  flex: 1;
++  min-height: 0;
 +  overflow: auto;
++  scrollbar-gutter: stable;
 +  padding: 0.75rem 1rem 1rem;
 +  display: flex;
 +  flex-direction: column;
@@ -5835,10 +5968,10 @@ index 00000000..e6847b2f
 +</style>
 diff --git a/frontend-audit/src/AuditBodyView.vue b/frontend-audit/src/AuditBodyView.vue
 new file mode 100644
-index 00000000..d981bb3a
+index 000000000..ab9fe46ad
 --- /dev/null
 +++ b/frontend-audit/src/AuditBodyView.vue
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,222 @@
 +<template>
 +  <div class="ab" data-testid="audit-body">
 +    <div class="ab-bar">
@@ -5884,7 +6017,13 @@ index 00000000..d981bb3a
 +// 只用于选择语言模式（不解析）：以 { / [ 开头按 JSON 展示
 +const json = computed(() => /^\s*[[{]/.test(props.text))
 +const wrap = ref(false)
-+const height = ref(MIN_HEIGHT)
++// 先按文本估算高度（单行长 JSON 排版后通常超过上限），编辑器加载与排版过程中不再明显撑高。
++function estimateHeight(t: string): number {
++  const lines = t.split('\n').length
++  if (lines === 1 && /^\s*[[{]/.test(t) && t.length > 200) return MAX_HEIGHT
++  return Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, lines * 18 + 10))
++}
++const height = ref(estimateHeight(props.text))
 +const loading = ref(true)
 +const loadError = ref('')
 +const ready = ref(false)
@@ -6055,12 +6194,214 @@ index 00000000..d981bb3a
 +  border-color: rgb(55 65 81);
 +}
 +</style>
+diff --git a/frontend-audit/src/AuditDiffView.vue b/frontend-audit/src/AuditDiffView.vue
+new file mode 100644
+index 000000000..fa62d9afd
+--- /dev/null
++++ b/frontend-audit/src/AuditDiffView.vue
+@@ -0,0 +1,196 @@
++<template>
++  <div class="ad" data-testid="audit-diff">
++    <div class="ad-bar">
++      <span class="ad-label"><span class="ad-tag ad-tag--base">{{ text.diffBase }}</span> {{ originalLabel }}</span>
++      <span class="ad-label"><span class="ad-tag">{{ text.diffTarget }}</span> {{ modifiedLabel }}</span>
++      <span class="ad-spacer"></span>
++      <span v-if="loadError" class="ad-bad">{{ loadError }}</span>
++      <span v-else-if="changes !== null" class="ad-muted" data-testid="audit-diff-changes">{{ changes === 0 ? text.diffNone : `${changes} ${text.diffChanges}` }}</span>
++      <button type="button" class="ad-btn" :class="{ 'ad-btn--on': sideBySide }" data-testid="audit-diff-sbs" @click="sideBySide = !sideBySide">
++        {{ sideBySide ? text.diffSideBySide : text.diffInline }}
++      </button>
++      <button type="button" class="ad-btn" :class="{ 'ad-btn--on': hideUnchanged }" @click="hideUnchanged = !hideUnchanged">{{ text.diffHideUnchanged }}</button>
++      <button type="button" class="ad-btn" :class="{ 'ad-btn--on': wrap }" @click="wrap = !wrap">{{ text.wrapLines }}</button>
++    </div>
++    <p v-if="note" class="ad-note">{{ note }}</p>
++    <div ref="host" class="ad-host" :style="{ height: `${height}px` }"></div>
++  </div>
++</template>
++
++<script setup lang="ts">
++import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
++import { useMutationObserver } from '@vueuse/core'
++import type * as Monaco from 'monaco-editor/editor/editor.api.js'
++import { useAuditText } from './i18n'
++
++const props = defineProps<{
++  original: string
++  modified: string
++  originalLabel: string
++  modifiedLabel: string
++  language?: 'json' | 'plaintext'
++  note?: string
++  /** 内容较短（报文头）时按行数自适应高度 */
++  compact?: boolean
++}>()
++const text = useAuditText()
++
++const sideBySide = ref(true)
++const hideUnchanged = ref(false)
++const wrap = ref(false)
++const changes = ref<number | null>(null)
++const loadError = ref('')
++
++const lines = computed(() => Math.max(props.original.split('\n').length, props.modified.split('\n').length))
++// 固定高度：避免编辑器加载、计算差异过程中撑开 / 收缩弹窗。
++const height = computed(() => (props.compact ? Math.min(420, Math.max(80, lines.value * 19 + 12)) : 560))
++
++const host = ref<HTMLElement>()
++const editor = shallowRef<Monaco.editor.IStandaloneDiffEditor>()
++let monaco: typeof Monaco | undefined
++let models: Monaco.editor.ITextModel[] = []
++let disposed = false
++
++const isDark = () => document.documentElement.classList.contains('dark')
++useMutationObserver(document.documentElement, () => monaco?.editor.setTheme(isDark() ? 'vs-dark' : 'vs'), {
++  attributes: true,
++  attributeFilter: ['class']
++})
++
++function setModels() {
++  const ed = editor.value
++  if (!ed || !monaco) return
++  const old = models
++  const lang = props.language ?? 'plaintext'
++  models = [monaco.editor.createModel(props.original, lang), monaco.editor.createModel(props.modified, lang)]
++  changes.value = null
++  ed.setModel({ original: models[0], modified: models[1] })
++  old.forEach((m) => m.dispose())
++}
++
++async function create() {
++  try {
++    monaco = (await import('./monaco')).monaco
++  } catch (e) {
++    loadError.value = (e as Error)?.message ?? String(e)
++    return
++  }
++  if (disposed || !host.value) return
++  const ed = monaco.editor.createDiffEditor(host.value, {
++    theme: isDark() ? 'vs-dark' : 'vs',
++    readOnly: true,
++    originalEditable: false,
++    domReadOnly: true,
++    renderSideBySide: sideBySide.value,
++    useInlineViewWhenSpaceIsLimited: false,
++    // 全文对比：不忽略空白，不设计算时限，不因文件大而跳过
++    ignoreTrimWhitespace: false,
++    maxComputationTime: 0,
++    maxFileSize: 0,
++    diffAlgorithm: 'advanced',
++    hideUnchangedRegions: { enabled: hideUnchanged.value },
++    wordWrap: wrap.value ? 'on' : 'off',
++    minimap: { enabled: false },
++    scrollBeyondLastLine: false,
++    automaticLayout: true,
++    fontSize: 12,
++    lineNumbersMinChars: 3,
++    renderLineHighlight: 'none',
++    contextmenu: false,
++    stickyScroll: { enabled: false }
++  })
++  editor.value = ed
++  ed.onDidUpdateDiff(() => {
++    changes.value = ed.getLineChanges()?.length ?? 0
++  })
++  setModels()
++}
++
++onMounted(create)
++onBeforeUnmount(() => {
++  disposed = true
++  editor.value?.dispose()
++  models.forEach((m) => m.dispose())
++})
++
++watch(() => [props.original, props.modified, props.language], setModels)
++watch(sideBySide, (on) => editor.value?.updateOptions({ renderSideBySide: on }))
++watch(hideUnchanged, (on) => editor.value?.updateOptions({ hideUnchangedRegions: { enabled: on } }))
++watch(wrap, (on) => editor.value?.updateOptions({ wordWrap: on ? 'on' : 'off' }))
++</script>
++
++<style scoped>
++.ad {
++  display: flex;
++  flex-direction: column;
++  gap: 0.3rem;
++  min-width: 0;
++}
++.ad-bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 0.4rem;
++  font-size: 0.75rem;
++}
++.ad-label {
++  display: inline-flex;
++  align-items: center;
++  gap: 0.25rem;
++}
++.ad-tag {
++  border-radius: 999px;
++  padding: 0 0.45rem;
++  line-height: 1.2rem;
++  background: rgb(220 252 231);
++  color: rgb(21 128 61);
++}
++.ad-tag--base {
++  background: rgb(254 226 226);
++  color: rgb(185 28 28);
++}
++.ad-spacer {
++  flex: 1;
++}
++.ad-muted {
++  color: rgb(107 114 128);
++}
++.ad-bad {
++  color: rgb(185 28 28);
++}
++.ad-note {
++  margin: 0;
++  font-size: 0.75rem;
++  color: rgb(107 114 128);
++}
++.ad-btn {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  padding: 0 0.5rem;
++  font-size: 0.75rem;
++  line-height: 1.4rem;
++  background: transparent;
++  color: inherit;
++  cursor: pointer;
++}
++.ad-btn--on {
++  background: rgb(219 234 254);
++  border-color: rgb(147 197 253);
++  color: rgb(29 78 216);
++}
++:global(.dark) .ad-btn--on {
++  background: rgb(30 58 138);
++  border-color: rgb(59 130 246);
++  color: rgb(219 234 254);
++}
++.ad-host {
++  min-width: 0;
++  width: 100%;
++  border: 1px solid rgb(229 231 235);
++  border-radius: 0.375rem;
++  overflow: hidden;
++}
++:global(.dark) .ad-host {
++  border-color: rgb(55 65 81);
++}
++</style>
 diff --git a/frontend-audit/src/AuditSectionPanel.vue b/frontend-audit/src/AuditSectionPanel.vue
 new file mode 100644
-index 00000000..58204a4d
+index 000000000..66cf33d89
 --- /dev/null
 +++ b/frontend-audit/src/AuditSectionPanel.vue
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,447 @@
 +<template>
 +  <article class="as-card" :data-testid="`audit-section-${kind}-${section.index}`">
 +    <div class="as-head">
@@ -6085,7 +6426,18 @@ index 00000000..58204a4d
 +    </div>
 +
 +    <details v-if="headerRows.length" class="as-details">
-+      <summary>{{ text.headers }} ({{ headerRows.length }})</summary>
++      <summary>
++        {{ text.headers }} ({{ headerRows.length }})
++        <button
++          v-if="target"
++          type="button"
++          class="as-btn as-btn--sm"
++          :class="{ 'as-btn--on': headerDiff }"
++          data-testid="audit-header-diff"
++          :title="diffTitle"
++          @click.prevent.stop="headerDiff = !headerDiff"
++        >{{ headerDiff ? text.diffExit : text.diff }}</button>
++      </summary>
 +      <div class="as-table-wrap">
 +        <table class="as-table">
 +          <tbody>
@@ -6097,6 +6449,14 @@ index 00000000..58204a4d
 +        </table>
 +      </div>
 +    </details>
++    <AuditDiffView
++      v-if="headerDiff && target"
++      compact
++      :original="headersToHTTP(target.section.header, isResponse)"
++      :modified="headersToHTTP(h, isResponse)"
++      :original-label="target.label"
++      :modified-label="selfLabel"
++    />
 +    <details v-if="metaRows.length" class="as-details">
 +      <summary>meta ({{ metaRows.length }})</summary>
 +      <pre class="as-pre">{{ JSON.stringify(meta, null, 2) }}</pre>
@@ -6110,26 +6470,56 @@ index 00000000..58204a4d
 +        </span>
 +        <span v-if="body.decode_error" class="as-badge as-badge--warn">{{ body.decode_error }}</span>
 +        <span class="as-spacer"></span>
++        <template v-if="target">
++          <select v-if="diffTargets!.length > 1" v-model="targetIndex" class="as-select" data-testid="audit-diff-target">
++            <option v-for="(t, i) in diffTargets" :key="i" :value="i">{{ text.diffBase }}: {{ t.label }}</option>
++          </select>
++          <button
++            type="button"
++            class="as-btn"
++            :class="{ 'as-btn--on': bodyDiff }"
++            data-testid="audit-body-diff"
++            :title="diffTitle"
++            @click="bodyDiff = !bodyDiff"
++          >{{ bodyDiff ? text.diffExit : text.diff }}</button>
++        </template>
 +        <button type="button" class="as-btn" :disabled="downloading" data-testid="audit-download-raw" @click="download(false)">{{ text.downloadRaw }}</button>
 +        <button v-if="body.content_encoding" type="button" class="as-btn" :disabled="downloading" @click="download(true)">{{ text.downloadDecoded }}</button>
 +      </div>
 +      <p v-if="downloadMsg" class="as-note" :class="downloadOk ? 'as-note--ok' : 'as-note--bad'" data-testid="audit-download-result">{{ downloadMsg }}</p>
 +      <p v-if="body.truncated_for_display" class="as-note as-note--warn">{{ text.truncatedForUI }}</p>
 +
-+      <template v-if="body.sse?.length">
-+        <div class="as-muted">
-+          {{ text.sseEvents }}: {{ body.sse.length }} ·
++      <div v-if="body.sse?.length || sseDiff" class="as-muted">
++        <template v-if="body.sse?.length">
++          {{ text.sseEvents }}: {{ body.sse.length }}<template v-if="mergedEvents.length !== body.sse.length"> → {{ mergedEvents.length }} ({{ text.merged }})</template> ·
 +          <span :class="body.sse_terminated ? 'as-ok' : 'as-warn'">{{ body.sse_terminated ? text.sseTerminated : text.sseNotTerminated }}</span>
-+          <button type="button" class="as-btn as-btn--link" @click="showRawSSE = !showRawSSE">{{ showRawSSE ? text.sseEvents : text.rawText }}</button>
-+        </div>
++        </template>
++        <button type="button" class="as-btn as-btn--link" data-testid="audit-sse-mode" @click="showRawSSE = !showRawSSE">{{ showRawSSE ? text.sseEvents : text.rawText }}</button>
++      </div>
++
++      <template v-if="bodyDiff && target">
++        <div v-if="diff.loading" class="as-muted as-diff-wait">{{ text.diffLoading }}</div>
++        <p v-else-if="diff.error" class="as-note as-note--bad">{{ diff.error }}</p>
++        <AuditDiffView
++          v-else
++          :original="diff.original"
++          :modified="diff.modified"
++          :language="diff.language"
++          :note="diff.note"
++          :original-label="target.label"
++          :modified-label="selfLabel"
++        />
++      </template>
++      <template v-else-if="body.sse?.length">
 +        <AuditBodyView v-if="showRawSSE" :text="body.text || ''" :truncated="body.truncated_for_display" />
-+        <ol v-else class="as-events">
++        <ol v-else class="as-events" data-testid="audit-sse-events">
 +          <li v-for="(ev, i) in visibleEvents" :key="i">
 +            <span class="as-badge as-badge--muted">{{ ev.event || 'message' }}</span>
++            <span v-if="ev.merged" class="as-badge as-badge--info">{{ text.merged }} ×{{ ev.merged }}</span>
 +            <code class="as-break">{{ ev.data }}</code>
 +          </li>
-+          <li v-if="body.sse.length > visibleEvents.length">
-+            <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ body.sse.length - visibleEvents.length }}</button>
++          <li v-if="mergedEvents.length > visibleEvents.length">
++            <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ mergedEvents.length - visibleEvents.length }}</button>
 +          </li>
 +        </ol>
 +      </template>
@@ -6161,12 +6551,21 @@ index 00000000..58204a4d
 +</template>
 +
 +<script setup lang="ts">
-+import { computed, ref } from 'vue'
-+import { downloadBody, saveBlob, type ArchiveKind, type SectionView } from './api'
++import { computed, reactive, ref, watch } from 'vue'
++import { downloadBody, fetchFullBodyText, saveBlob, type ArchiveKind, type SectionView } from './api'
 +import AuditBodyView from './AuditBodyView.vue'
++import AuditDiffView from './AuditDiffView.vue'
++import { headersToHTTP, isSSE, prettyJSONRaw, type DiffTarget } from './diffText'
 +import { useAuditText } from './i18n'
++import { mergeSSE, parseSSE, renderSSE } from './sse'
 +
-+const props = defineProps<{ section: SectionView; kind: ArchiveKind; archiveRef: string }>()
++const props = defineProps<{
++  section: SectionView
++  kind: ArchiveKind
++  archiveRef: string
++  /** 差异对比的基底候选（实际上游请求：客户端请求；客户端响应：各次上游响应） */
++  diffTargets?: DiffTarget[]
++}>()
 +const text = useAuditText()
 +
 +const h = computed(() => props.section.header)
@@ -6181,7 +6580,50 @@ index 00000000..58204a4d
 +const metaRows = computed(() => Object.keys(meta.value))
 +const showRawSSE = ref(false)
 +const eventLimit = ref(500)
-+const visibleEvents = computed(() => body.value?.sse?.slice(0, eventLimit.value) ?? [])
++// 「SSE 事件」模式：连续的增量事件合并展示（原文与下载不受影响）
++const mergedEvents = computed(() => mergeSSE(body.value?.sse ?? []))
++const visibleEvents = computed(() => mergedEvents.value.slice(0, eventLimit.value))
++
++// ---- 差异对比 ----
++const isResponse = computed(() => props.kind === 'upstream_response' || props.kind === 'client_response')
++const targetIndex = ref(Math.max(0, (props.diffTargets?.length ?? 1) - 1))
++const target = computed<DiffTarget | undefined>(() => props.diffTargets?.[targetIndex.value])
++const selfLabel = computed(() => `${text.value.files[props.kind]}${props.kind.startsWith('upstream') ? ` #${props.section.seq}` : ''}`)
++const diffTitle = computed(() => (isResponse.value ? text.value.diffTitleResponse : text.value.diffTitleRequest))
++const headerDiff = ref(false)
++const bodyDiff = ref(false)
++const sseDiff = computed(() => bodyDiff.value && !!target.value && (isSSE(h.value) || isSSE(target.value.section.header)))
++const diff = reactive({ loading: false, error: '', original: '', modified: '', language: 'plaintext' as 'json' | 'plaintext', note: '' })
++let diffGen = 0
++
++/** 对比用文本：取完整正文（不受展示截断影响），SSE 跟随展示模式，JSON 按原文排版。 */
++async function loadBodyDiff() {
++  const t = target.value
++  if (!bodyDiff.value || !t) return
++  const gen = ++diffGen
++  diff.loading = true
++  diff.error = ''
++  try {
++    const [base, self] = await Promise.all([
++      fetchFullBodyText(props.archiveRef, t.kind, t.section.index),
++      fetchFullBodyText(props.archiveRef, props.kind, props.section.index)
++    ])
++    if (gen !== diffGen) return
++    if (sseDiff.value) {
++      const shape = (s: string) => (showRawSSE.value ? s : renderSSE(mergeSSE(parseSSE(s)), prettyJSONRaw))
++      Object.assign(diff, { original: shape(base), modified: shape(self), language: 'plaintext', note: showRawSSE.value ? text.value.diffSSERaw : text.value.diffSSEMerged })
++    } else if (/^\s*[[{]/.test(base) || /^\s*[[{]/.test(self)) {
++      Object.assign(diff, { original: prettyJSONRaw(base), modified: prettyJSONRaw(self), language: 'json', note: text.value.diffJSONRaw })
++    } else {
++      Object.assign(diff, { original: base, modified: self, language: 'plaintext', note: '' })
++    }
++  } catch (e) {
++    if (gen === diffGen) diff.error = (e as { message?: string })?.message ?? String(e)
++  } finally {
++    if (gen === diffGen) diff.loading = false
++  }
++}
++watch([bodyDiff, target, showRawSSE], loadBodyDiff)
 +const visibleMessages = computed(() => props.section.messages?.slice(0, eventLimit.value) ?? [])
 +
 +const downloading = ref(false)
@@ -6270,6 +6712,10 @@ index 00000000..58204a4d
 +  background: rgb(254 243 199);
 +  color: rgb(146 64 14);
 +}
++.as-badge--info {
++  background: rgb(219 234 254);
++  color: rgb(29 78 216);
++}
 +.as-badge--muted {
 +  background: rgb(243 244 246);
 +  color: rgb(75 85 99);
@@ -6334,6 +6780,37 @@ index 00000000..58204a4d
 +  color: inherit;
 +  cursor: pointer;
 +}
++.as-btn--sm {
++  margin-left: 0.4rem;
++  line-height: 1.2rem;
++}
++.as-btn--on {
++  background: rgb(219 234 254);
++  border-color: rgb(147 197 253);
++  color: rgb(29 78 216);
++}
++:global(.dark) .as-btn--on {
++  background: rgb(30 58 138);
++  border-color: rgb(59 130 246);
++  color: rgb(219 234 254);
++}
++.as-select {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  font-size: 0.75rem;
++  line-height: 1.4rem;
++  padding: 0 0.3rem;
++  background: transparent;
++  color: inherit;
++}
++.as-diff-wait {
++  height: 560px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  border: 1px dashed rgb(209 213 219);
++  border-radius: 0.375rem;
++}
 +.as-btn--link {
 +  border: none;
 +  color: rgb(37 99 235);
@@ -6374,10 +6851,10 @@ index 00000000..58204a4d
 +</style>
 diff --git a/frontend-audit/src/api.ts b/frontend-audit/src/api.ts
 new file mode 100644
-index 00000000..3d912e75
+index 000000000..8308f864c
 --- /dev/null
 +++ b/frontend-audit/src/api.ts
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,244 @@
 +import { apiClient } from '@/api/client'
 +
 +export type ArchiveKind = 'client_request' | 'upstream_request' | 'upstream_response' | 'client_response'
@@ -6583,7 +7060,33 @@ index 00000000..3d912e75
 +  const filename = match?.[1] || `${ref.split('/').pop()}-${kind}-${index}${decode ? '-decoded' : ''}.bin`
 +  const expectedSha256 = (resp.headers['x-archive-body-sha256'] as string | undefined) || undefined
 +  const actualSha256 = !decode ? await sha256Hex(blob) : undefined
-+  return { blob, filename: decode ? filename.replace(/\.bin$/, '-decoded.bin') : filename, expectedSha256, actualSha256 }
++  return { blob, filename, expectedSha256, actualSha256 }
++}
++
++// 差异对比用的完整正文（按 Content-Encoding 解码），按归档引用缓存，避免重复下载。
++const fullTextCache = new Map<string, Promise<string>>()
++
++/** 读取某段的完整正文文本（不受展示上限截断）。 */
++export function fetchFullBodyText(ref: string, kind: ArchiveKind, index: number): Promise<string> {
++  const key = `${ref}|${kind}|${index}`
++  let p = fullTextCache.get(key)
++  if (!p) {
++    p = apiClient
++      .get<Blob>(`${BASE}/body`, { params: { ref, kind, index, decode: 1 }, responseType: 'blob', timeout: 0 })
++      .then((resp) => resp.data.text())
++    p.catch(() => fullTextCache.delete(key))
++    if (fullTextCache.size > 32) fullTextCache.delete(fullTextCache.keys().next().value as string)
++    fullTextCache.set(key, p)
++  }
++  return p
++}
++
++/** 下载整个请求：zip 内为该请求的存档数据原样（单个 .zst）。 */
++export async function downloadBundle(ref: string): Promise<DownloadResult> {
++  const resp = await apiClient.get<Blob>(`${BASE}/bundle`, { params: { ref }, responseType: 'blob', timeout: 0 })
++  const disposition = String(resp.headers['content-disposition'] || '')
++  const match = /filename="?([^";]+)"?/.exec(disposition)
++  return { blob: resp.data, filename: match?.[1] || `${ref.split('/').pop()}.zip` }
 +}
 +
 +export function saveBlob(blob: Blob, filename: string) {
@@ -6596,12 +7099,116 @@ index 00000000..3d912e75
 +  a.remove()
 +  setTimeout(() => URL.revokeObjectURL(url), 1000)
 +}
+diff --git a/frontend-audit/src/diffText.ts b/frontend-audit/src/diffText.ts
+new file mode 100644
+index 000000000..c79eaa40c
+--- /dev/null
++++ b/frontend-audit/src/diffText.ts
+@@ -0,0 +1,98 @@
++// 差异对比用的文本整理：JSON 按原文排版（不经 JSON.parse，转义、数字写法逐字保留），
++// 报文头按 HTTP 文本形式输出。
++import type { ArchiveKind, SectionHeader, SectionView } from './api'
++
++/**
++ * 按原文排版 JSON：只在字符串之外的 { } [ ] , : 处插入换行与缩进，
++ * 字符串与数字等字面量逐字保留（例如 < 不会被还原为 <）。
++ * 不是 JSON（不以 { 或 [ 开头）时原样返回。
++ */
++export function prettyJSONRaw(src: string, indent = '  '): string {
++  const s = src.trim()
++  if (!/^[[{]/.test(s)) return src
++  let out = ''
++  let depth = 0
++  let inStr = false
++  let esc = false
++  const nl = () => '\n' + indent.repeat(depth)
++  for (let i = 0; i < s.length; i++) {
++    const ch = s[i]
++    if (inStr) {
++      out += ch
++      if (esc) esc = false
++      else if (ch === '\\') esc = true
++      else if (ch === '"') inStr = false
++      continue
++    }
++    switch (ch) {
++      case '"':
++        inStr = true
++        out += ch
++        break
++      case '{':
++      case '[': {
++        // 空对象 / 空数组保持在一行
++        let j = i + 1
++        while (j < s.length && /\s/.test(s[j])) j++
++        const close = ch === '{' ? '}' : ']'
++        if (s[j] === close) {
++          out += ch + close
++          i = j
++        } else {
++          depth++
++          out += ch + nl()
++        }
++        break
++      }
++      case '}':
++      case ']':
++        depth = Math.max(0, depth - 1)
++        out += nl() + ch
++        break
++      case ',':
++        out += ',' + nl()
++        break
++      case ':':
++        out += ': '
++        break
++      default:
++        if (!/\s/.test(ch)) out += ch
++    }
++  }
++  return out
++}
++
++const REASONS: Record<number, string> = {
++  100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
++  301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
++  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed',
++  408: 'Request Timeout', 409: 'Conflict', 413: 'Payload Too Large', 422: 'Unprocessable Entity', 429: 'Too Many Requests',
++  499: 'Client Closed Request', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout',
++  529: 'Overloaded'
++}
++
++/**
++ * 报文头的 HTTP 文本形式：请求首行 `METHOD URL PROTO`，响应首行 `PROTO STATUS REASON`；
++ * 其后每行 `Name: value`，按头名（不区分大小写）排序，同名多值逐行列出。
++ */
++export function headersToHTTP(h: SectionHeader, response: boolean): string {
++  const proto = h.proto || 'HTTP/1.1'
++  const first = response ? `${proto} ${h.status ?? ''} ${REASONS[h.status ?? 0] ?? ''}`.trimEnd() : `${h.method ?? ''} ${h.url ?? ''} ${proto}`.trim()
++  const rows = Object.entries(h.header ?? {})
++    .sort(([a], [b]) => a.toLowerCase().localeCompare(b.toLowerCase()) || a.localeCompare(b))
++    .flatMap(([k, vs]) => vs.map((v) => `${k}: ${v}`))
++  return [first, ...rows].join('\n')
++}
++
++/** 判断段是否为 SSE。 */
++export function isSSE(h: SectionHeader): boolean {
++  const ct = Object.entries(h.header ?? {}).find(([k]) => k.toLowerCase() === 'content-type')?.[1]?.[0] ?? ''
++  return h.transport === 'sse' || ct.toLowerCase().startsWith('text/event-stream')
++}
++
++/** 差异对比的基底段（请求：客户端请求；响应：上游响应）。 */
++export interface DiffTarget {
++  label: string
++  kind: ArchiveKind
++  section: SectionView
++}
 diff --git a/frontend-audit/src/i18n.ts b/frontend-audit/src/i18n.ts
 new file mode 100644
-index 00000000..2d4824ee
+index 000000000..f2aad5673
 --- /dev/null
 +++ b/frontend-audit/src/i18n.ts
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,240 @@
 +import { computed } from 'vue'
 +import { useI18n } from 'vue-i18n'
 +
@@ -6694,7 +7301,24 @@ index 00000000..2d4824ee
 +  copyFailed: '复制失败，请手动选择文本复制',
 +  wrapLines: '自动换行',
 +  expandAll: '全部展开',
-+  collapseAll: '全部折叠'
++  collapseAll: '全部折叠',
++  diff: '差异',
++  diffExit: '退出差异',
++  diffTitleRequest: '以客户端请求为基底，对比实际上游请求',
++  diffTitleResponse: '以上游响应为基底，对比客户端响应',
++  diffBase: '基底',
++  diffTarget: '对比',
++  diffLoading: '正在读取完整正文…',
++  diffSideBySide: '并排',
++  diffInline: '合并',
++  diffHideUnchanged: '折叠相同内容',
++  diffNone: '无差异',
++  diffChanges: '处差异',
++  diffSSEMerged: 'SSE 事件按合并后的结果对比',
++  diffSSERaw: 'SSE 按原文对比',
++  diffJSONRaw: 'JSON 已按原文排版（转义与数字写法逐字保留）',
++  merged: '合并',
++  downloadBundle: '下载整个请求'
 +}
 +
 +type Dict = typeof zh
@@ -6789,7 +7413,24 @@ index 00000000..2d4824ee
 +  copyFailed: 'Copy failed; select the text and copy manually',
 +  wrapLines: 'Wrap lines',
 +  expandAll: 'Expand all',
-+  collapseAll: 'Collapse all'
++  collapseAll: 'Collapse all',
++  diff: 'Diff',
++  diffExit: 'Exit diff',
++  diffTitleRequest: 'Client request (base) vs actual upstream request',
++  diffTitleResponse: 'Upstream response (base) vs client response',
++  diffBase: 'Base',
++  diffTarget: 'Compared',
++  diffLoading: 'Loading full bodies…',
++  diffSideBySide: 'Side by side',
++  diffInline: 'Inline',
++  diffHideUnchanged: 'Collapse unchanged',
++  diffNone: 'No differences',
++  diffChanges: 'changes',
++  diffSSEMerged: 'SSE compared after merging events',
++  diffSSERaw: 'SSE compared as raw text',
++  diffJSONRaw: 'JSON laid out from the raw text (escapes and number literals kept)',
++  merged: 'merged',
++  downloadBundle: 'Download whole request'
 +}
 +
 +export function useAuditText() {
@@ -6810,10 +7451,10 @@ index 00000000..2d4824ee
 +}
 diff --git a/frontend-audit/src/monaco.ts b/frontend-audit/src/monaco.ts
 new file mode 100644
-index 00000000..996e974e
+index 000000000..0b13b8ca3
 --- /dev/null
 +++ b/frontend-audit/src/monaco.ts
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,21 @@
 +// Monaco Editor（VS Code 编辑器内核）按需加载入口：只引入 JSON 展示用到的功能。
 +import * as monaco from 'monaco-editor/editor/editor.api.js'
 +import 'monaco-editor/language/json/monaco.contribution.js'
@@ -6822,6 +7463,11 @@ index 00000000..996e974e
 +import 'monaco-editor/editor/contrib/find/browser/findController.js'
 +import 'monaco-editor/editor/contrib/clipboard/browser/clipboard.js'
 +import 'monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js'
++// JSON 语言服务（jsonMode，首次出现 JSON 时按需加载）会经由 internal/common/workers.js 注册全部编辑器扩展与服务。
++// 若它晚于第一个编辑器加载，之后新建的编辑器会因服务注册晚于服务初始化而抛出
++// "depends on UNKNOWN service ..." 错误。这里提前同步引入，保证注册先于任何编辑器创建
++//（该模块本就会被 jsonMode 引入，提前只改变加载顺序，不增加体积）。
++import 'monaco-editor/internal/common/workers.js'
 +import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker'
 +import JsonWorker from 'monaco-editor/language/json/json.worker.js?worker'
 +
@@ -6830,9 +7476,209 @@ index 00000000..996e974e
 +}
 +
 +export { monaco }
+diff --git a/frontend-audit/src/sse.ts b/frontend-audit/src/sse.ts
+new file mode 100644
+index 000000000..8e27f9ff5
+--- /dev/null
++++ b/frontend-audit/src/sse.ts
+@@ -0,0 +1,194 @@
++// SSE 解析与增量事件合并（仅用于「SSE 事件」展示与差异对比；原文与下载不受影响）。
++//
++// 合并规则：
++//   - 各协议的增量事件，只要没遇到开始 / 结束事件，就把同一内容块的相邻增量合并为一条；
++//   - 不同内容块（Anthropic index、Responses item/content、Chat choice、Gemini candidate）分别合并；
++//   - 夹在中间的其它事件（ping、message_delta、response.in_progress…）原样保留、不丢；
++//     合并后的事件位于该组第一个增量的位置，被跨过的事件按原顺序排在其后；
++//   - 只做无损合并：文本类字段拼接，相同值保留，遇到无法无损合并的字段则另起一组。
++import type { SSEEvent } from './api'
++
++export interface MergedSSEEvent extends SSEEvent {
++  /** 合并的原始事件数（>1 表示合并而来） */
++  merged?: number
++}
++
++/** 解析 SSE 文本（与后端 parseSSE 一致：空行分隔，event / id / data 行）。 */
++export function parseSSE(text: string): SSEEvent[] {
++  const out: SSEEvent[] = []
++  for (const block of text.replace(/\r\n/g, '\n').split('\n\n')) {
++    if (!block.trim()) continue
++    const ev: SSEEvent = { data: '' }
++    const data: string[] = []
++    for (const line of block.split('\n')) {
++      if (line.startsWith('event:')) ev.event = line.slice(6).trim()
++      else if (line.startsWith('id:')) ev.id = line.slice(3).trim()
++      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
++    }
++    ev.data = data.join('\n')
++    out.push(ev)
++  }
++  return out
++}
++
++type Json = any // eslint-disable-line @typescript-eslint/no-explicit-any
++
++/** 文本类字段：增量拼接。 */
++const CONCAT = new Set(['text', 'partial_json', 'thinking', 'signature', 'delta', 'content', 'reasoning_content', 'reasoning', 'refusal', 'arguments'])
++/** 逐条变化、只是序号 / 填充的字段：保留第一条。 */
++const KEEP_FIRST = new Set(['sequence_number', 'obfuscation'])
++/** 累计型统计：取最新一条。 */
++const TAKE_LATEST = new Set(['usage', 'usageMetadata'])
++/** Anthropic 可无损拼接的增量类型。 */
++const ANTHROPIC_TEXT_DELTAS = new Set(['text_delta', 'input_json_delta', 'thinking_delta', 'signature_delta'])
++
++const isObj = (v: unknown): v is Record<string, Json> => typeof v === 'object' && v !== null && !Array.isArray(v)
++const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v)))
++const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
++
++/** 把 src 合并进 t（原地）；无法无损合并时返回 false（调用方需在副本上执行）。 */
++function mergeInto(t: Record<string, Json>, s: Record<string, Json>): boolean {
++  for (const [k, sv] of Object.entries(s)) {
++    const tv = t[k]
++    if (tv === undefined) {
++      t[k] = clone(sv)
++    } else if (typeof sv === 'string' && typeof tv === 'string' && CONCAT.has(k)) {
++      t[k] = tv + sv
++    } else if (same(tv, sv) || KEEP_FIRST.has(k)) {
++      // 保留
++    } else if (TAKE_LATEST.has(k)) {
++      t[k] = clone(sv)
++    } else if (isObj(tv) && isObj(sv)) {
++      if (!mergeInto(tv, sv)) return false
++    } else if (Array.isArray(tv) && Array.isArray(sv)) {
++      if (!mergeArray(k, tv, sv)) return false
++    } else {
++      return false
++    }
++  }
++  return true
++}
++
++function mergeArray(key: string, t: Json[], s: Json[]): boolean {
++  if (key === 'parts') {
++    // Gemini：文本 part 拼进最后一个同类文本 part，其它 part 追加
++    for (const p of s) {
++      const last = t[t.length - 1]
++      const textOnly = (x: Json) => isObj(x) && typeof x.text === 'string' && Object.keys(x).every((k) => k === 'text' || k === 'thought')
++      if (textOnly(p) && textOnly(last) && !!last.thought === !!p.thought) last.text += p.text
++      else t.push(clone(p))
++    }
++    return true
++  }
++  const keyed = s.every((x) => isObj(x) && typeof x.index === 'number')
++  for (let i = 0; i < s.length; i++) {
++    const sv = s[i]
++    const tv = keyed ? t.find((x) => isObj(x) && x.index === sv.index) : t[i]
++    if (tv === undefined) t.push(clone(sv))
++    else if (isObj(tv) && isObj(sv)) {
++      if (!mergeInto(tv, sv)) return false
++    } else if (!same(tv, sv)) return false
++  }
++  return true
++}
++
++type Classified = { kind: 'delta'; key: string } | { kind: 'boundary' } | { kind: 'other' }
++
++function indexes(arr: Json[]): string {
++  return arr.map((x, i) => (isObj(x) && typeof x.index === 'number' ? x.index : i)).join(',')
++}
++
++/** 判断事件类型：增量（可合并）/ 开始结束边界 / 其它。 */
++export function classifySSE(ev: SSEEvent, obj: Json): Classified {
++  if (ev.data.trim() === '[DONE]') return { kind: 'boundary' }
++  if (!isObj(obj)) return { kind: 'other' }
++  const type: string = typeof obj.type === 'string' ? obj.type : ev.event ?? ''
++
++  // Anthropic Messages
++  if (type === 'content_block_delta') {
++    if (isObj(obj.delta) && ANTHROPIC_TEXT_DELTAS.has(obj.delta.type)) return { kind: 'delta', key: `anthropic:${obj.index}:${obj.delta.type}` }
++    return { kind: 'other' }
++  }
++  if (['message_start', 'message_stop', 'content_block_start', 'content_block_stop'].includes(type)) return { kind: 'boundary' }
++
++  // OpenAI Responses
++  if (type.startsWith('response.')) {
++    if (type.endsWith('.delta') && typeof obj.delta === 'string') {
++      const part = obj.content_index ?? obj.summary_index ?? ''
++      return { kind: 'delta', key: `responses:${type}:${obj.item_id ?? ''}:${obj.output_index ?? ''}:${part}` }
++    }
++    if (['response.created', 'response.completed', 'response.failed', 'response.incomplete', 'response.done'].includes(type) || type.endsWith('.added') || type.endsWith('.done')) {
++      return { kind: 'boundary' }
++    }
++    return { kind: 'other' }
++  }
++
++  // OpenAI Chat Completions
++  if (Array.isArray(obj.choices)) {
++    if (obj.choices.some((c: Json) => isObj(c) && c.finish_reason != null)) return { kind: 'boundary' }
++    if (obj.choices.length && obj.choices.every((c: Json) => isObj(c) && isObj(c.delta))) return { kind: 'delta', key: `chat:${indexes(obj.choices)}` }
++    return { kind: 'other' }
++  }
++
++  // Gemini
++  if (Array.isArray(obj.candidates)) {
++    if (obj.candidates.some((c: Json) => isObj(c) && c.finishReason != null)) return { kind: 'boundary' }
++    if (obj.candidates.length) return { kind: 'delta', key: `gemini:${indexes(obj.candidates)}` }
++  }
++  return { kind: 'other' }
++}
++
++function parseData(data: string): Json {
++  try {
++    return JSON.parse(data)
++  } catch {
++    return undefined
++  }
++}
++
++/** 合并相邻增量事件；其余事件原样保留。 */
++export function mergeSSE(events: SSEEvent[]): MergedSSEEvent[] {
++  const out: MergedSSEEvent[] = []
++  // 当前未结束的内容块：key → 输出中的位置与合并对象
++  const open = new Map<string, { at: number; obj: Json }>()
++  for (const ev of events) {
++    const obj = parseData(ev.data)
++    const c = classifySSE(ev, obj)
++    if (c.kind === 'boundary') {
++      open.clear()
++      out.push({ ...ev })
++      continue
++    }
++    if (c.kind === 'other') {
++      out.push({ ...ev })
++      continue
++    }
++    const cur = open.get(c.key)
++    if (cur) {
++      const next = clone(cur.obj)
++      if (mergeInto(next, obj)) {
++        cur.obj = next
++        const target = out[cur.at]
++        target.data = JSON.stringify(next)
++        target.merged = (target.merged ?? 1) + 1
++        continue
++      }
++    }
++    open.set(c.key, { at: out.length, obj })
++    out.push({ ...ev })
++  }
++  return out
++}
++
++/** 把事件序列渲染为 SSE 文本（用于差异对比）：data 为 JSON 时按原文排版。 */
++export function renderSSE(events: MergedSSEEvent[], pretty: (s: string) => string): string {
++  return events
++    .map((ev) => {
++      const lines: string[] = []
++      if (ev.event) lines.push(`event: ${ev.event}`)
++      if (ev.id) lines.push(`id: ${ev.id}`)
++      lines.push(`data: ${pretty(ev.data)}`)
++      return lines.join('\n')
++    })
++    .join('\n\n')
++}
 diff --git a/frontend-audit/tools/verify-patch.mjs b/frontend-audit/tools/verify-patch.mjs
 new file mode 100644
-index 00000000..9e4308cf
+index 000000000..9e4308cff
 --- /dev/null
 +++ b/frontend-audit/tools/verify-patch.mjs
 @@ -0,0 +1,24 @@
@@ -6862,7 +7708,7 @@ index 00000000..9e4308cf
 +if (failed) process.exit(1)
 diff --git a/frontend-audit/tsconfig.json b/frontend-audit/tsconfig.json
 new file mode 100644
-index 00000000..51f753a5
+index 000000000..51f753a55
 --- /dev/null
 +++ b/frontend-audit/tsconfig.json
 @@ -0,0 +1,14 @@
@@ -6882,7 +7728,7 @@ index 00000000..51f753a5
 +}
 diff --git a/frontend-audit/vite.config.mts b/frontend-audit/vite.config.mts
 new file mode 100644
-index 00000000..d051c9c0
+index 000000000..d051c9c0b
 --- /dev/null
 +++ b/frontend-audit/vite.config.mts
 @@ -0,0 +1,37 @@

@@ -143,6 +143,7 @@ docs/*
 !docs/channel-monitor-v2-safe-defaults.md
 !docs/codex-credits.md
 !docs/legal/
+!docs/audit-archive/
 !docs/legal/*.md
 !docs/screenshots/
 docs/screenshots/*

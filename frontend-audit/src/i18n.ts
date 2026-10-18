@@ -1,0 +1,192 @@
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+
+const zh = {
+  open: '报文',
+  openTitle: '查看请求报文归档',
+  title: '请求报文归档',
+  close: '关闭',
+  loading: '正在读取归档…',
+  retry: '重试',
+  errForbidden: '无权限查看归档（需要管理员权限，或登录已过期）。',
+  errDisabled: '服务端未启用请求归档（audit.enabled=false）。',
+  errUsageMissing: '用量记录不存在（可能已被清理）。',
+  errGeneric: '读取归档失败',
+  notFound: '未找到该用量记录对应的归档。可能产生于启用归档之前、归档文件已被清理，或请求未经过网关采集。',
+  ambiguous: '找到多个候选归档且无法唯一确定，请选择：',
+  alternatives: '已按关联证据选择最佳匹配，另有候选：',
+  choose: '查看',
+  current: '当前',
+  statusComplete: '完整',
+  statusIncomplete: '不完整',
+  statusInProgress: '进行中 / 未落盘',
+  statusMissing: '缺失',
+  issues: '完整性问题',
+  summary: '链路关联',
+  usageId: '用量记录',
+  usageRequestId: '用量 request_id',
+  clientRequestId: '客户端请求 ID',
+  archiveRef: '归档位置',
+  session: '会话',
+  trace: 'Trace / Span',
+  apiKey: 'API Key',
+  user: '用户',
+  account: '账户',
+  clientStatus: '客户端状态码',
+  duration: '耗时',
+  usageCallbacks: '用量回调',
+  usageCallbackHint: '回调仅表示仓储写入已返回，不代表事务已提交；以数据库中的用量记录为准。',
+  attempts: '调度尝试',
+  attempt: '尝试',
+  reused: '复用连接',
+  files: {
+    client_request: '客户端请求',
+    upstream_request: '实际上游请求',
+    upstream_response: '上游响应',
+    client_response: '客户端响应'
+  } as Record<string, string>,
+  fileStatus: {
+    ok: '正常',
+    missing: '文件缺失',
+    empty: '未落盘（进行中或进程退出）',
+    truncated: '文件截断',
+    corrupt: '文件损坏',
+    error: '读取错误'
+  } as Record<string, string>,
+  noSections: '无内容',
+  headers: '请求头 / 响应头',
+  body: '正文',
+  bytes: '字节',
+  hashOk: '哈希一致',
+  hashBad: '哈希不一致',
+  incompleteSection: '未正常结束',
+  truncatedForUI: '正文超过展示上限，仅展示前部分；完整内容请下载。',
+  downloadRaw: '下载原始',
+  downloadDecoded: '下载解码',
+  downloadVerified: '下载完成，SHA-256 与归档一致',
+  downloadMismatch: '下载完成，但 SHA-256 与归档记录不一致',
+  downloadDone: '下载完成',
+  sseEvents: 'SSE 事件',
+  sseTerminated: '正常终止',
+  sseNotTerminated: '未见终止事件',
+  wsMessages: 'WebSocket 消息',
+  rawText: '原文',
+  pretty: '格式化',
+  binary: '二进制内容（Base64）',
+  encoding: '内容编码',
+  decodedForView: '已为展示解码',
+  replay: '传输层重放',
+  empty: '（空）',
+  copy: '复制',
+  copied: '已复制到剪贴板',
+  copiedTruncated: '已复制（展示内容已截断，完整内容请下载）',
+  copyFailed: '复制失败，请手动选择文本复制',
+  wrapLines: '自动换行',
+  expandAll: '全部展开',
+  collapseAll: '全部折叠'
+}
+
+type Dict = typeof zh
+
+const en: Dict = {
+  ...zh,
+  open: 'Payload',
+  openTitle: 'View archived request payloads',
+  title: 'Request archive',
+  close: 'Close',
+  loading: 'Loading archive…',
+  retry: 'Retry',
+  errForbidden: 'Not allowed to view archives (admin required, or session expired).',
+  errDisabled: 'Request archive is disabled on the server (audit.enabled=false).',
+  errUsageMissing: 'Usage record not found (it may have been cleaned up).',
+  errGeneric: 'Failed to load archive',
+  notFound: 'No archive found for this usage record. It may predate archiving, the files may have been cleaned up, or the request bypassed the gateway capture.',
+  ambiguous: 'Several candidate archives match and none can be chosen uniquely. Pick one:',
+  alternatives: 'Best match selected by correlation evidence; other candidates:',
+  choose: 'View',
+  current: 'Current',
+  statusComplete: 'Complete',
+  statusIncomplete: 'Incomplete',
+  statusInProgress: 'In progress / not flushed',
+  statusMissing: 'Missing',
+  issues: 'Integrity issues',
+  summary: 'Correlation',
+  usageId: 'Usage record',
+  usageRequestId: 'Usage request_id',
+  clientRequestId: 'Client request ID',
+  archiveRef: 'Archive path',
+  session: 'Session',
+  trace: 'Trace / Span',
+  apiKey: 'API key',
+  user: 'User',
+  account: 'Account',
+  clientStatus: 'Client status',
+  duration: 'Duration',
+  usageCallbacks: 'Usage callbacks',
+  usageCallbackHint: 'A callback only means the repository write returned; it does not prove the transaction committed. The usage record in the database is authoritative.',
+  attempts: 'Upstream attempts',
+  attempt: 'Attempt',
+  reused: 'reused conn',
+  files: {
+    client_request: 'Client request',
+    upstream_request: 'Upstream request',
+    upstream_response: 'Upstream response',
+    client_response: 'Client response'
+  },
+  fileStatus: {
+    ok: 'OK',
+    missing: 'File missing',
+    empty: 'Not flushed (in progress or process exited)',
+    truncated: 'File truncated',
+    corrupt: 'File corrupt',
+    error: 'Read error'
+  },
+  noSections: 'No content',
+  headers: 'Headers',
+  body: 'Body',
+  bytes: 'bytes',
+  hashOk: 'hash OK',
+  hashBad: 'hash mismatch',
+  incompleteSection: 'not completed',
+  truncatedForUI: 'Body exceeds the display limit; only the beginning is shown. Download for the full content.',
+  downloadRaw: 'Download raw',
+  downloadDecoded: 'Download decoded',
+  downloadVerified: 'Downloaded; SHA-256 matches the archive',
+  downloadMismatch: 'Downloaded, but SHA-256 differs from the archive record',
+  downloadDone: 'Downloaded',
+  sseEvents: 'SSE events',
+  sseTerminated: 'terminated normally',
+  sseNotTerminated: 'no terminal event seen',
+  wsMessages: 'WebSocket messages',
+  rawText: 'Raw',
+  pretty: 'Pretty',
+  binary: 'Binary content (Base64)',
+  encoding: 'Content-Encoding',
+  decodedForView: 'decoded for display',
+  replay: 'transport replay',
+  empty: '(empty)',
+  copy: 'Copy',
+  copied: 'Copied to clipboard',
+  copiedTruncated: 'Copied (display is truncated; download for the full content)',
+  copyFailed: 'Copy failed; select the text and copy manually',
+  wrapLines: 'Wrap lines',
+  expandAll: 'Expand all',
+  collapseAll: 'Collapse all'
+}
+
+export function useAuditText() {
+  const { locale } = useI18n({ useScope: 'global' })
+  return computed<Dict>(() => (String(locale.value).startsWith('zh') ? zh : en))
+}
+
+export function formatBytes(n: number | undefined): string {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let v = n
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}

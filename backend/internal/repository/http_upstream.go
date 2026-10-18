@@ -26,6 +26,7 @@ import (
 	"golang.org/x/mod/semver"
 	"golang.org/x/net/http2"
 
+	"github.com/Wei-Shaw/sub2api/internal/audit"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyutil"
@@ -218,6 +219,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 
 	// 执行请求
 	client := s.httpClientForUpstreamRequest(entry.client, req)
+	client = audit.WrapClient(client, audit.AttemptInfo{AccountID: accountID, Proxy: proxyURL, Via: "http_upstream"})
 	client = httpClientWithGrokAccessDeniedFallback(client)
 	resp, err := doUpstreamRequest(client, req)
 	if err != nil {
@@ -279,6 +281,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	}
 
 	client := s.httpClientForUpstreamRequest(entry.client, req)
+	client = audit.WrapClient(client, audit.AttemptInfo{AccountID: accountID, Proxy: proxyURL, Via: "http_upstream_tls"})
 	client = httpClientWithGrokAccessDeniedFallback(client)
 	resp, err := doUpstreamRequest(client, req)
 	if err != nil {

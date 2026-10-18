@@ -1,0 +1,5860 @@
+diff --git a/backend/cmd/server/main.go b/backend/cmd/server/main.go
+index 8494713ba..2f604adeb 100644
+--- a/backend/cmd/server/main.go
++++ b/backend/cmd/server/main.go
+@@ -16,6 +16,7 @@ import (
+ 	"time"
+ 
+ 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
++	"github.com/Wei-Shaw/sub2api/internal/audit"
+ 	"github.com/Wei-Shaw/sub2api/internal/config"
+ 	"github.com/Wei-Shaw/sub2api/internal/handler"
+ 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+@@ -152,6 +153,8 @@ func runMainServer() {
+ 	if err != nil {
+ 		log.Fatalf("Failed to initialize application: %v", err)
+ 	}
++	// 请求报文归档（internal/audit）：在时区初始化之后、开始接收请求之前初始化，默认目录 ./data/audit。
++	audit.Init()
+ 	defer app.Cleanup()
+ 	if app.PluginManager != nil {
+ 		if err := app.PluginManager.Start(context.Background()); err != nil {
+@@ -190,6 +193,12 @@ func runMainServer() {
+ 	if err := app.Server.Shutdown(ctx); err != nil {
+ 		log.Printf("Server forced to shutdown: %v", err)
+ 	}
++	// 等待请求报文归档完成压缩落盘（internal/audit）。
++	auditCtx, auditCancel := context.WithTimeout(context.Background(), audit.ConfigFromViper().FinalizeTimeout)
++	if err := audit.Shutdown(auditCtx); err != nil {
++		log.Printf("Request archive flush incomplete: %v", err)
++	}
++	auditCancel()
+ 
+ 	log.Println("Server exited")
+ }
+diff --git a/backend/go.mod b/backend/go.mod
+index 2e68ebc9a..63b7707d7 100644
+--- a/backend/go.mod
++++ b/backend/go.mod
+@@ -50,6 +50,8 @@ require (
+ 	github.com/tiktoken-go/tokenizer v0.8.0
+ 	github.com/wechatpay-apiv3/wechatpay-go v0.2.21
+ 	github.com/zeromicro/go-zero v1.9.4
++	go.opentelemetry.io/otel v1.44.0
++	go.opentelemetry.io/otel/trace v1.44.0
+ 	go.uber.org/zap v1.24.0
+ 	golang.org/x/crypto v0.57.0
+ 	golang.org/x/image v0.41.0
+@@ -193,9 +195,7 @@ require (
+ 	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
+ 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+ 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
+-	go.opentelemetry.io/otel v1.44.0 // indirect
+ 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
+-	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+ 	go.uber.org/automaxprocs v1.6.0 // indirect
+ 	go.uber.org/multierr v1.9.0 // indirect
+diff --git a/backend/internal/audit/api.go b/backend/internal/audit/api.go
+new file mode 100644
+index 000000000..51de0794e
+--- /dev/null
++++ b/backend/internal/audit/api.go
+@@ -0,0 +1,294 @@
++package audit
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"path"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
++	"github.com/gin-gonic/gin"
++)
++
++// UsageRef 是用量记录中与归档关联的字段（由装配层从数据库读取）。
++type UsageRef struct {
++	ID        int64     `json:"id"`
++	RequestID string    `json:"request_id"`
++	APIKeyID  int64     `json:"api_key_id"`
++	AccountID int64     `json:"account_id"`
++	UserID    int64     `json:"user_id"`
++	CreatedAt time.Time `json:"created_at"`
++}
++
++// UsageLookup 按 ID 读取用量记录；不存在时返回 (nil, nil)。
++type UsageLookup func(ctx context.Context, id int64) (*UsageRef, error)
++
++// Candidate 是一条候选归档。
++type Candidate struct {
++	Ref         string       `json:"ref"`
++	Entries     []IndexEntry `json:"entries"`
++	Score       int          `json:"score"`
++	MatchReason []string     `json:"match_reason"`
++}
++
++// RegisterRoutes 注册管理端归档接口（调用方负责挂在管理员鉴权之后）。
++func RegisterRoutes(g *gin.RouterGroup, lookup UsageLookup) {
++	a := g.Group("/audit-archive")
++	a.GET("/status", handleStatus)
++	a.GET("/usage/:id", func(c *gin.Context) { handleUsage(c, lookup) })
++	a.GET("/lookup", handleLookup)
++	a.GET("/archive", handleArchive)
++	a.GET("/body", handleBody)
++}
++
++func storeOr503(c *gin.Context) *Store {
++	s := Default()
++	if s == nil {
++		response.ErrorWithDetails(c, http.StatusServiceUnavailable, "request archive is disabled", "AUDIT_ARCHIVE_DISABLED", nil)
++		return nil
++	}
++	return s
++}
++
++func handleStatus(c *gin.Context) {
++	s := Default()
++	if s == nil {
++		response.Success(c, gin.H{"enabled": false})
++		return
++	}
++	response.Success(c, gin.H{"enabled": true, "root": s.Root(), "stats": s.StatsSnapshot(), "display_body_limit": s.cfg.DisplayBodyLimit})
++}
++
++// lookupKeys 用量 request_id 通常为 "client:<客户端请求ID>"；两者都查。
++func lookupKeys(id string) []string {
++	id = strings.TrimSpace(id)
++	keys := []string{id}
++	if rest, ok := strings.CutPrefix(id, "client:"); ok && rest != "" {
++		keys = append(keys, rest)
++	}
++	return keys
++}
++
++// Resolve 汇总候选归档并按关联证据打分。
++func (s *Store) Resolve(u *UsageRef) ([]Candidate, error) {
++	byRef := map[string]*Candidate{}
++	var order []string
++	for _, key := range lookupKeys(u.RequestID) {
++		entries, err := s.Lookup(key)
++		if err != nil {
++			return nil, err
++		}
++		for _, e := range entries {
++			cand, ok := byRef[e.Ref]
++			if !ok {
++				cand = &Candidate{Ref: e.Ref}
++				byRef[e.Ref] = cand
++				order = append(order, e.Ref)
++			}
++			cand.Entries = append(cand.Entries, e)
++		}
++	}
++	out := make([]Candidate, 0, len(order))
++	for _, ref := range order {
++		cand := byRef[ref]
++		reasons := map[string]bool{}
++		for _, e := range cand.Entries {
++			if e.Via == "usage_callback" && e.UsageRequestID == u.RequestID {
++				reasons["usage_callback_request_id"] = true
++				if u.APIKeyID != 0 && e.APIKeyID == u.APIKeyID {
++					reasons["api_key_id"] = true
++				}
++				if u.AccountID != 0 && e.AccountID == u.AccountID {
++					reasons["account_id"] = true
++				}
++			}
++			if e.Via == "client_request_id" {
++				reasons["client_request_id"] = true
++				if !u.CreatedAt.IsZero() {
++					d := u.CreatedAt.Sub(e.Time)
++					if d >= -time.Minute && d <= 6*time.Hour {
++						reasons["time_window"] = true
++					}
++				}
++			}
++		}
++		for r := range reasons {
++			cand.MatchReason = append(cand.MatchReason, r)
++			cand.Score++
++			if r == "usage_callback_request_id" {
++				cand.Score += 2
++			}
++		}
++		out = append(out, *cand)
++	}
++	return out, nil
++}
++
++func handleUsage(c *gin.Context, lookup UsageLookup) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
++	if err != nil || id <= 0 {
++		response.BadRequest(c, "invalid usage id")
++		return
++	}
++	if lookup == nil {
++		response.InternalError(c, "usage lookup not configured")
++		return
++	}
++	u, err := lookup(c.Request.Context(), id)
++	if err != nil {
++		response.ErrorFrom(c, err)
++		return
++	}
++	if u == nil {
++		response.ErrorWithDetails(c, http.StatusNotFound, "usage record not found", "USAGE_NOT_FOUND", nil)
++		return
++	}
++	cands, err := s.Resolve(u)
++	if err != nil {
++		response.InternalError(c, "archive index read failed: "+err.Error())
++		return
++	}
++	result := gin.H{"usage": u, "candidates": cands}
++	chosen := strings.TrimSpace(c.Query("ref"))
++	switch {
++	case chosen != "":
++		found := false
++		for _, cand := range cands {
++			found = found || cand.Ref == chosen
++		}
++		if !found {
++			response.ErrorWithDetails(c, http.StatusBadRequest, "ref does not belong to this usage record", "AUDIT_REF_MISMATCH", nil)
++			return
++		}
++		result["resolution"] = "chosen"
++	case len(cands) == 0:
++		result["resolution"] = "not_found"
++		response.Success(c, result)
++		return
++	case len(cands) == 1:
++		chosen = cands[0].Ref
++		result["resolution"] = "unique"
++	default:
++		best, tie := -1, false
++		for i, cand := range cands {
++			if best < 0 || cand.Score > cands[best].Score {
++				best, tie = i, false
++			} else if cand.Score == cands[best].Score {
++				tie = true
++			}
++		}
++		if tie {
++			result["resolution"] = "ambiguous"
++			response.Success(c, result)
++			return
++		}
++		chosen = cands[best].Ref
++		result["resolution"] = "best_match_with_alternatives"
++	}
++	av, err := s.ReadArchive(chosen)
++	if err != nil {
++		response.InternalError(c, err.Error())
++		return
++	}
++	result["ref"] = chosen
++	result["archive"] = av
++	response.Success(c, result)
++}
++
++func handleLookup(c *gin.Context) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	id := strings.TrimSpace(c.Query("request_id"))
++	if id == "" {
++		response.BadRequest(c, "request_id is required")
++		return
++	}
++	cands, err := s.Resolve(&UsageRef{RequestID: id})
++	if err != nil {
++		response.InternalError(c, err.Error())
++		return
++	}
++	response.Success(c, gin.H{"candidates": cands})
++}
++
++func handleArchive(c *gin.Context) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	ref := c.Query("ref")
++	if !ValidRef(ref) {
++		response.BadRequest(c, "invalid ref")
++		return
++	}
++	av, err := s.ReadArchive(ref)
++	if err != nil {
++		response.InternalError(c, err.Error())
++		return
++	}
++	response.Success(c, av)
++}
++
++// handleBody 下载某段正文：decode=0 为原始字节（与 SHA256 头一致），
++// decode=1 按 Content-Encoding 在内存中流式解码。传输压缩交给前置 Nginx 协商。
++func handleBody(c *gin.Context) {
++	s := storeOr503(c)
++	if s == nil {
++		return
++	}
++	ref, kind := c.Query("ref"), c.Query("kind")
++	index, err := strconv.Atoi(c.DefaultQuery("index", "0"))
++	if err != nil || index < 0 {
++		response.BadRequest(c, "invalid index")
++		return
++	}
++	if _, err := s.FilePath(ref, kind); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	decode := c.Query("decode") == "1"
++	started := false
++	_, err = s.StreamBody(c.Writer, ref, kind, index, decode, func(info BodyInfo) {
++		started = true
++		h := info.Header
++		name := fmt.Sprintf("%s-%s-%d.bin", path.Base(ref), kind, index)
++		c.Header("Content-Type", "application/octet-stream")
++		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
++		c.Header("X-Content-Type-Options", "nosniff")
++		c.Header("Cache-Control", "private, no-store")
++		if ct := headerValue(h.Header, "Content-Type"); ct != "" {
++			c.Header("X-Archive-Original-Content-Type", ct)
++		}
++		if enc := headerValue(h.Header, "Content-Encoding"); enc != "" {
++			c.Header("X-Archive-Content-Encoding", enc)
++		}
++		if !decode {
++			c.Header("X-Archive-Body-SHA256", info.SHA256)
++			c.Header("X-Archive-Body-Bytes", strconv.FormatInt(info.Bytes, 10))
++			c.Header("X-Archive-Intact", strconv.FormatBool(info.Intact))
++		}
++		if info.End != nil {
++			c.Header("X-Archive-Complete", strconv.FormatBool(info.End.Complete))
++		}
++		c.Status(http.StatusOK)
++	})
++	if err != nil && !started {
++		if errors.Is(err, errSectionNotFound) {
++			response.NotFound(c, err.Error())
++			return
++		}
++		response.NotFound(c, "archive body unavailable: "+err.Error())
++	}
++}
++
++var errSectionNotFound = errors.New("audit: section not found")
+diff --git a/backend/internal/audit/archive.go b/backend/internal/audit/archive.go
+new file mode 100644
+index 000000000..df7175415
+--- /dev/null
++++ b/backend/internal/audit/archive.go
+@@ -0,0 +1,370 @@
++package audit
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"sort"
++
++	"github.com/cespare/xxhash/v2"
++)
++
++// ArchiveView 是一次客户端请求的完整归档视图（四份文件 + 调度尝试汇总）。
++type ArchiveView struct {
++	Ref      string         `json:"ref"`
++	Files    []*FileView    `json:"files"`
++	Summary  map[string]any `json:"summary"`
++	Attempts []AttemptView  `json:"attempts"`
++	// Status: complete / incomplete / in_progress / missing
++	Status string   `json:"status"`
++	Issues []string `json:"issues,omitempty"`
++}
++
++// AttemptView 汇总一次上游调度尝试。
++type AttemptView struct {
++	Seq        int    `json:"seq"`
++	AccountID  any    `json:"account_id,omitempty"`
++	Method     string `json:"method,omitempty"`
++	URL        string `json:"url,omitempty"`
++	Transport  string `json:"transport,omitempty"`
++	Status     int    `json:"status,omitempty"`
++	SpanID     any    `json:"span_id,omitempty"`
++	Error      string `json:"error,omitempty"`
++	Complete   bool   `json:"complete"`
++	WSReused   bool   `json:"ws_reused,omitempty"`
++	RequestIdx []int  `json:"request_sections"`
++	RespIdx    []int  `json:"response_sections"`
++}
++
++// ReadArchive 读取并解析某个归档引用下的四份文件。
++func (s *Store) ReadArchive(ref string) (*ArchiveView, error) {
++	if !ValidRef(ref) {
++		return nil, errors.New("audit: invalid archive ref")
++	}
++	av := &ArchiveView{Ref: ref, Summary: map[string]any{}}
++	limit := s.cfg.DisplayBodyLimit
++	if limit <= 0 {
++		limit = DefaultConfig().DisplayBodyLimit
++	}
++	byKind := map[string]*FileView{}
++	missing := 0
++	for _, kind := range Kinds {
++		p, err := s.FilePath(ref, kind)
++		if err != nil {
++			return nil, err
++		}
++		fv := ReadFile(p, kind, limit)
++		av.Files = append(av.Files, fv)
++		byKind[kind] = fv
++		if fv.Status == "missing" {
++			missing++
++		}
++	}
++	if missing == len(Kinds) {
++		av.Status = "missing"
++		return av, nil
++	}
++	s.postProcessWS(byKind)
++	av.Attempts = buildAttempts(byKind[KindUpstreamRequest], byKind[KindUpstreamResponse])
++
++	// 汇总与完整性判断
++	if cr := byKind[KindClientRequest]; len(cr.Sections) > 0 {
++		h := cr.Sections[0].Header
++		av.Summary["method"] = h.Method
++		av.Summary["url"] = h.URL
++		av.Summary["transport"] = h.Transport
++		av.Summary["started_at"] = h.Time
++		for k, v := range h.Meta {
++			av.Summary[k] = v
++		}
++	}
++	if cw := byKind[KindClientResponse]; len(cw.Sections) > 0 {
++		sec := cw.Sections[0]
++		av.Summary["client_status"] = sec.Header.Status
++		if sec.End != nil {
++			for k, v := range sec.End.Meta {
++				av.Summary[k] = v
++			}
++			av.Summary["finished_at"] = sec.End.Time
++		}
++		av.Summary["usage_notes"] = cw.Notes
++	}
++	av.Status = "complete"
++	for _, fv := range av.Files {
++		switch fv.Status {
++		case "empty":
++			av.Status = "in_progress"
++			av.Issues = append(av.Issues, fmt.Sprintf("%s: not yet flushed (request in progress, or process exited before flush)", fv.Kind))
++		case "ok":
++		default:
++			if av.Status == "complete" {
++				av.Status = "incomplete"
++			}
++			av.Issues = append(av.Issues, fmt.Sprintf("%s: %s %s", fv.Kind, fv.Status, fv.Error))
++		}
++		for _, sec := range fv.Sections {
++			if sec.End == nil {
++				if av.Status == "complete" {
++					av.Status = "incomplete"
++				}
++				av.Issues = append(av.Issues, fmt.Sprintf("%s#%d: section has no end marker", fv.Kind, sec.Index))
++			} else if !sec.End.Complete {
++				av.Issues = append(av.Issues, fmt.Sprintf("%s#%d: %s", fv.Kind, sec.Index, sec.End.Error))
++			}
++			if sec.HashMatch != nil && !*sec.HashMatch {
++				av.Status = "incomplete"
++				av.Issues = append(av.Issues, fmt.Sprintf("%s#%d: body hash mismatch", fv.Kind, sec.Index))
++			}
++		}
++	}
++	if av.Status == "complete" {
++		if cw := byKind[KindClientResponse]; len(cw.Sections) == 0 || cw.Sections[0].End == nil || !cw.Sections[0].End.Complete {
++			av.Status = "incomplete"
++		}
++	}
++	return av, nil
++}
++
++// postProcessWS 把客户端侧劫持连接的原始字节解析为 WebSocket 消息。
++func (s *Store) postProcessWS(byKind map[string]*FileView) {
++	cr, cw := byKind[KindClientRequest], byKind[KindClientResponse]
++	ext := ""
++	if len(cw.Sections) > 0 {
++		ext = headerValue(cw.Sections[0].Header.Header, "Sec-WebSocket-Extensions")
++	}
++	defl := parseWSExtensions(ext)
++	for _, sec := range cr.Sections {
++		if len(sec.rawConn) > 0 {
++			sec.Messages, sec.MessagesTruncated = parseWSFrames(sec.rawConn, "client→gateway", defl, true, 5000)
++			sec.MessagesTruncated = sec.MessagesTruncated || sec.overflow
++		}
++		sec.rawConn = nil
++	}
++	for _, sec := range cw.Sections {
++		if len(sec.rawConn) > 0 {
++			sec.Messages, sec.MessagesTruncated = parseWSFrames(sec.rawConn, "gateway→client", defl, false, 5000)
++			sec.MessagesTruncated = sec.MessagesTruncated || sec.overflow
++		}
++		sec.rawConn = nil
++	}
++	for _, kind := range []string{KindUpstreamRequest, KindUpstreamResponse} {
++		dir := "gateway→upstream"
++		if kind == KindUpstreamResponse {
++			dir = "upstream→gateway"
++		}
++		for _, sec := range byKind[kind].Sections {
++			for i := range sec.Messages {
++				sec.Messages[i].Dir = dir
++			}
++			sec.rawConn = nil
++		}
++	}
++}
++
++func buildAttempts(req, resp *FileView) []AttemptView {
++	m := map[int]*AttemptView{}
++	get := func(seq int) *AttemptView {
++		if a, ok := m[seq]; ok {
++			return a
++		}
++		a := &AttemptView{Seq: seq, Complete: true, RequestIdx: []int{}, RespIdx: []int{}}
++		m[seq] = a
++		return a
++	}
++	for _, sec := range req.Sections {
++		a := get(sec.Seq)
++		a.RequestIdx = append(a.RequestIdx, sec.Index)
++		if sec.Header.Method != "" && a.Method == "" {
++			a.Method, a.URL = sec.Header.Method, sec.Header.URL
++			a.AccountID = sec.Header.Meta["account_id"]
++			a.SpanID = sec.Header.Meta["span_id"]
++		}
++		if a.Transport == "" {
++			a.Transport = sec.Header.Transport
++		}
++		if v, ok := sec.Header.Meta["ws_reused"].(bool); ok && v {
++			a.WSReused = true
++		}
++		if sec.End == nil || !sec.End.Complete {
++			a.Complete = false
++		}
++	}
++	for _, sec := range resp.Sections {
++		a := get(sec.Seq)
++		a.RespIdx = append(a.RespIdx, sec.Index)
++		if sec.Header.Status != 0 && a.Status == 0 {
++			a.Status = sec.Header.Status
++		}
++		if a.AccountID == nil {
++			a.AccountID = sec.Header.Meta["account_id"]
++		}
++		if sec.End == nil || !sec.End.Complete {
++			a.Complete = false
++			if sec.End != nil && a.Error == "" {
++				a.Error = sec.End.Error
++			}
++		}
++	}
++	out := make([]AttemptView, 0, len(m))
++	for _, a := range m {
++		out = append(out, *a)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
++	return out
++}
++
++// BodyInfo 是下载前预扫描得到的段信息。SHA256 / Bytes 为读取时对原始正文的计算值，
++// Intact 表示与写入时记录的字节数、xxhash64 一致。
++type BodyInfo struct {
++	Header SectionHeader
++	End    *SectionEnd
++	SHA256 string
++	Bytes  int64
++	Intact bool
++}
++
++// StreamBody 把某段正文原样（或按 Content-Encoding 解码后）流式写出，
++// 全程在内存中解压，不落临时文件。返回写出的字节数。
++func (s *Store) StreamBody(w io.Writer, ref, kind string, index int, decode bool, onHeader func(BodyInfo)) (int64, error) {
++	p, err := s.FilePath(ref, kind)
++	if err != nil {
++		return 0, err
++	}
++	// 先扫描一遍取段头/段尾并计算 SHA-256（用于响应头），再流式输出正文。
++	info, err := s.sectionMeta(p, index)
++	if err != nil {
++		return 0, err
++	}
++	hdr := info.Header
++	if onHeader != nil {
++		onHeader(info)
++	}
++	enc := headerValue(hdr.Header, "Content-Encoding")
++	if !decode || enc == "" || enc == "identity" {
++		return s.copySection(w, p, index)
++	}
++	pr, pw := io.Pipe()
++	go func() {
++		_, err := s.copySection(pw, p, index)
++		_ = pw.CloseWithError(err)
++	}()
++	rc, err := DecodeReader(enc, pr)
++	if err != nil {
++		_ = pr.CloseWithError(err)
++		return 0, err
++	}
++	defer func() { _ = rc.Close(); _ = pr.Close() }()
++	return io.Copy(w, rc)
++}
++
++func (s *Store) walkSections(path string, fn func(idx int, f frame) bool) error {
++	f, err := os.Open(path) //nolint:gosec // 已校验
++	if err != nil {
++		return err
++	}
++	defer func() { _ = f.Close() }()
++	dec, err := newDecoder(f)
++	if err != nil {
++		return err
++	}
++	defer dec.Close()
++	fr, err := openFrames(dec)
++	if err != nil {
++		return err
++	}
++	latest := map[uint16]int{}
++	count := 0
++	var buf []byte
++	for {
++		fx, err := fr.next(buf)
++		if errors.Is(err, io.EOF) {
++			return nil
++		}
++		if err != nil {
++			return err
++		}
++		buf = fx.payload[:0]
++		idx := -1
++		if fx.typ == FrameHeader {
++			idx = count
++			latest[fx.seq] = count
++			count++
++		} else if v, ok := latest[fx.seq]; ok {
++			idx = v
++		}
++		if idx >= 0 && !fn(idx, fx) {
++			return nil
++		}
++	}
++}
++
++func (s *Store) sectionMeta(path string, index int) (BodyInfo, error) {
++	var hdr SectionHeader
++	var end *SectionEnd
++	found := false
++	sh, xh := sha256.New(), xxhash.New()
++	var n int64
++	err := s.walkSections(path, func(idx int, f frame) bool {
++		if idx != index {
++			return true
++		}
++		switch f.typ {
++		case FrameHeader:
++			found = true
++			_ = jsonUnmarshal(f.payload, &hdr)
++		case FrameBody:
++			_, _ = sh.Write(f.payload)
++			_, _ = xh.Write(f.payload)
++			n += int64(len(f.payload))
++		case FrameEnd:
++			var e SectionEnd
++			if jsonUnmarshal(f.payload, &e) == nil {
++				end = &e
++			}
++			return false
++		}
++		return true
++	})
++	if err != nil && !found {
++		return BodyInfo{}, err
++	}
++	if !found {
++		return BodyInfo{}, fmt.Errorf("%w: %d", errSectionNotFound, index)
++	}
++	info := BodyInfo{Header: hdr, End: end, SHA256: hex.EncodeToString(sh.Sum(nil)), Bytes: n}
++	info.Intact = end != nil && end.Bytes == n && end.XXH64 == xxh64Hex(xh.Sum64())
++	return info, nil
++}
++
++func (s *Store) copySection(w io.Writer, path string, index int) (int64, error) {
++	var n int64
++	var werr error
++	err := s.walkSections(path, func(idx int, f frame) bool {
++		if idx != index {
++			return true
++		}
++		if f.typ == FrameEnd {
++			return false
++		}
++		if f.typ != FrameBody {
++			return true
++		}
++		m, err := w.Write(f.payload)
++		n += int64(m)
++		if err != nil {
++			werr = err
++			return false
++		}
++		return true
++	})
++	if werr != nil {
++		return n, werr
++	}
++	return n, err
++}
++
++var jsonUnmarshal = json.Unmarshal
+diff --git a/backend/internal/audit/config.go b/backend/internal/audit/config.go
+new file mode 100644
+index 000000000..68207f9ec
+--- /dev/null
++++ b/backend/internal/audit/config.go
+@@ -0,0 +1,159 @@
++// Package audit 实现网关请求报文的全量归档：每个客户端请求采集
++// 客户端请求、实际上游请求、上游响应、客户端响应四份 Header/Body，
++// 以 zstd 整体压缩写入本地目录，并提供按需流式读取的管理接口。
++//
++// 该包刻意不依赖 service / repository / middleware 等业务包，
++// 业务侧只通过少量钩子（Gin 中间件、RoundTripper、WS Tap、OnUsage）接入，
++// 以保证可作为独立补丁在基线上应用。
++package audit
++
++import (
++	"net/http"
++	"runtime"
++	"strings"
++	"time"
++
++	"github.com/spf13/viper"
++)
++
++// Config 控制归档行为。所有字段都可由 config.yaml 的 `audit:` 段或
++// AUDIT_* 环境变量（viper AutomaticEnv，`.` 映射为 `_`）配置。
++type Config struct {
++	// Enabled 为 false 时所有钩子直接透传，不产生任何文件。
++	Enabled bool
++	// RootDir 归档根目录，默认 ./data/audit。
++	RootDir string
++	// SessionHeaders 按优先级查找会话 ID 的请求头。
++	SessionHeaders []string
++	// RedactHeaders 落盘前需要脱敏的鉴权类 Header（大小写不敏感）。
++	RedactHeaders []string
++	// RedactQueryParams 落盘前需要脱敏的 URL 查询参数（例如 Gemini 的 ?key=）。
++	RedactQueryParams []string
++	// SessionCacheSize 会话→日期目录缓存的最大条目数（有界 LRU）。
++	SessionCacheSize int
++	// MemoryBufferBytes 单个文件在内存中累积到该大小前不启用流式压缩，
++	// 结束时一次性压缩；超过后切换为后台流式压缩，避免大正文占用内存。
++	MemoryBufferBytes int
++	// EncoderLevel zstd 压缩级别：fastest / default / better / best。
++	EncoderLevel string
++	// DisplayBodyLimit 管理接口单段正文的展示上限（字节），超出部分只能下载；
++	// 仅影响展示，不影响存储。
++	DisplayBodyLimit int
++	// FinalizeTimeout 关闭归档（停机）时等待未完成写入的最长时间。
++	FinalizeTimeout time.Duration
++	// FlushWorkers 后台落盘并发上限（创建文件 + 压缩写入），限制同时打开的文件数。
++	FlushWorkers int
++}
++
++// DefaultSessionHeaders 覆盖常见客户端的会话头：
++// Claude Code（X-Claude-Code-Session-Id）、Codex（session_id / conversation_id）、
++// OpenRouter 及通用客户端（X-Session-Id / Session-Id）、OpenCode、Gemini CLI。
++var DefaultSessionHeaders = []string{
++	"X-Claude-Code-Session-Id",
++	"session_id",
++	"Session-Id",
++	"X-Session-Id",
++	"conversation_id",
++	"X-OpenCode-Session",
++	"X-Gemini-Session-Id",
++	"X-Goog-Session-Id",
++}
++
++// DefaultRedactHeaders 仅包含鉴权类 Header。
++var DefaultRedactHeaders = []string{
++	"Authorization",
++	"Proxy-Authorization",
++	"X-Api-Key",
++	"Api-Key",
++	"X-Goog-Api-Key",
++	"Cookie",
++	"Set-Cookie",
++	"X-Auth-Token",
++}
++
++// DefaultRedactQueryParams 仅包含鉴权类查询参数。
++var DefaultRedactQueryParams = []string{"key", "api_key", "access_token"}
++
++// DefaultConfig 返回默认配置（默认开启，根目录 ./data/audit）。
++func DefaultConfig() Config {
++	return Config{
++		Enabled:           true,
++		RootDir:           "./data/audit",
++		SessionHeaders:    append([]string(nil), DefaultSessionHeaders...),
++		RedactHeaders:     append([]string(nil), DefaultRedactHeaders...),
++		RedactQueryParams: append([]string(nil), DefaultRedactQueryParams...),
++		SessionCacheSize:  10000,
++		MemoryBufferBytes: 512 << 10,
++		EncoderLevel:      "fastest",
++		DisplayBodyLimit:  4 << 20,
++		FinalizeTimeout:   30 * time.Second,
++		FlushWorkers:      max(4, 2*runtime.GOMAXPROCS(0)),
++	}
++}
++
++// ConfigFromViper 从全局 viper 读取 `audit.*`，缺省项回落到 DefaultConfig。
++// 主配置加载（config.Load）已对全局 viper 启用 AutomaticEnv，因此
++// AUDIT_ENABLED / AUDIT_ROOT_DIR 等环境变量同样生效。
++func ConfigFromViper() Config {
++	cfg := DefaultConfig()
++	if viper.IsSet("audit.enabled") {
++		cfg.Enabled = viper.GetBool("audit.enabled")
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.root_dir")); v != "" {
++		cfg.RootDir = v
++	}
++	if v := viper.GetStringSlice("audit.session_headers"); len(v) > 0 {
++		cfg.SessionHeaders = splitList(v)
++	}
++	if v := viper.GetStringSlice("audit.redact_headers"); len(v) > 0 {
++		cfg.RedactHeaders = splitList(v)
++	}
++	if v := viper.GetStringSlice("audit.redact_query_params"); len(v) > 0 {
++		cfg.RedactQueryParams = splitList(v)
++	}
++	if v := viper.GetInt("audit.session_cache_size"); v > 0 {
++		cfg.SessionCacheSize = v
++	}
++	if v := viper.GetInt("audit.memory_buffer_bytes"); v > 0 {
++		cfg.MemoryBufferBytes = v
++	}
++	if v := strings.TrimSpace(viper.GetString("audit.encoder_level")); v != "" {
++		cfg.EncoderLevel = v
++	}
++	if v := viper.GetInt("audit.display_body_limit"); v > 0 {
++		cfg.DisplayBodyLimit = v
++	}
++	if v := viper.GetDuration("audit.finalize_timeout"); v > 0 {
++		cfg.FinalizeTimeout = v
++	}
++	if v := viper.GetInt("audit.flush_workers"); v > 0 {
++		cfg.FlushWorkers = v
++	}
++	return cfg
++}
++
++// splitList 兼容环境变量中逗号分隔的写法。
++func splitList(values []string) []string {
++	out := make([]string, 0, len(values))
++	for _, v := range values {
++		for _, part := range strings.Split(v, ",") {
++			if part = strings.TrimSpace(part); part != "" {
++				out = append(out, part)
++			}
++		}
++	}
++	return out
++}
++
++func canonicalSet(values []string) map[string]struct{} {
++	set := make(map[string]struct{}, len(values))
++	for _, v := range values {
++		v = strings.TrimSpace(v)
++		if v == "" {
++			continue
++		}
++		set[strings.ToLower(v)] = struct{}{}
++		set[strings.ToLower(http.CanonicalHeaderKey(v))] = struct{}{}
++	}
++	return set
++}
+diff --git a/backend/internal/audit/file.go b/backend/internal/audit/file.go
+new file mode 100644
+index 000000000..62a1e2d99
+--- /dev/null
++++ b/backend/internal/audit/file.go
+@@ -0,0 +1,216 @@
++package audit
++
++import (
++	"bufio"
++	"errors"
++	"os"
++	"sync"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++var errFileClosed = errors.New("audit: archive file closed")
++
++// codec 持有压缩器：一个并发安全的 EncodeAll 编码器（小文件一次性压缩）
++// 和一个流式编码器池（大正文后台流式压缩，复用以控制内存）。
++type codec struct {
++	all     *zstd.Encoder
++	streams sync.Pool
++	opts    []zstd.EOption
++}
++
++func newCodec(level string) (*codec, error) {
++	lvl := zstd.SpeedFastest
++	switch level {
++	case "default":
++		lvl = zstd.SpeedDefault
++	case "better":
++		lvl = zstd.SpeedBetterCompression
++	case "best":
++		lvl = zstd.SpeedBestCompression
++	}
++	opts := []zstd.EOption{
++		zstd.WithEncoderLevel(lvl),
++		zstd.WithEncoderConcurrency(1),
++		zstd.WithLowerEncoderMem(true),
++		zstd.WithWindowSize(1 << 20),
++		zstd.WithEncoderCRC(true),
++		zstd.WithZeroFrames(true),
++	}
++	all, err := zstd.NewWriter(nil, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return &codec{all: all, opts: opts}, nil
++}
++
++func (c *codec) getStream(w *bufio.Writer) (*zstd.Encoder, error) {
++	if enc, ok := c.streams.Get().(*zstd.Encoder); ok {
++		enc.Reset(w)
++		return enc, nil
++	}
++	return zstd.NewWriter(w, c.opts...)
++}
++
++func (c *codec) putStream(enc *zstd.Encoder) {
++	enc.Reset(nil)
++	c.streams.Put(enc)
++}
++
++// archiveFile 是单个 .zst 归档文件的写入端。
++//
++// 写入路径只做内存追加（拷贝），不在业务 goroutine 上压缩，也不做任何文件系统操作：
++//   - 原始内容不超过 threshold 时，关闭阶段一次性 EncodeAll；
++//   - 超过后切换为流式模式，由专属 goroutine 后台压缩落盘，
++//     业务侧仍只是入队，SSE/大正文不受压缩速度影响。
++type archiveFile struct {
++	mu        sync.Mutex
++	codec     *codec
++	open      func() (*os.File, error) // 延迟创建文件（后台 goroutine 中调用）
++	threshold int
++	buf       []byte
++	closed    bool
++	raw       int64
++
++	// 流式模式
++	streaming bool
++	cond      *sync.Cond
++	queue     [][]byte
++	finishing bool
++	done      chan error
++}
++
++func newArchiveFile(open func() (*os.File, error), c *codec, threshold int) *archiveFile {
++	af := &archiveFile{codec: c, open: open, threshold: threshold}
++	af.buf = append(make([]byte, 0, 4096), fileMagic...)
++	af.raw = int64(len(fileMagic))
++	return af
++}
++
++// writeFrame 追加一个帧；payload 超过 maxFramePayload 时自动拆分。
++func (a *archiveFile) writeFrame(typ byte, seq uint16, payload []byte) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed {
++		return errFileClosed
++	}
++	for {
++		n := len(payload)
++		if n > maxFramePayload {
++			n = maxFramePayload
++		}
++		a.appendLocked(typ, seq, payload[:n])
++		payload = payload[n:]
++		if len(payload) == 0 {
++			return nil
++		}
++	}
++}
++
++func (a *archiveFile) appendLocked(typ byte, seq uint16, payload []byte) {
++	a.raw += int64(frameHeaderSize + len(payload))
++	if !a.streaming {
++		a.buf = encodeFrameHeader(a.buf, typ, seq, len(payload))
++		a.buf = append(a.buf, payload...)
++		if len(a.buf) > a.threshold {
++			a.startStreamLocked()
++		}
++		return
++	}
++	chunk := make([]byte, 0, frameHeaderSize+len(payload))
++	chunk = encodeFrameHeader(chunk, typ, seq, len(payload))
++	chunk = append(chunk, payload...)
++	a.queue = append(a.queue, chunk)
++	a.cond.Signal()
++}
++
++func (a *archiveFile) startStreamLocked() {
++	a.streaming = true
++	a.cond = sync.NewCond(&a.mu)
++	a.queue = append(a.queue, a.buf)
++	a.buf = nil
++	a.done = make(chan error, 1)
++	go a.streamLoop()
++}
++
++func (a *archiveFile) streamLoop() {
++	f, err := a.open()
++	var bw *bufio.Writer
++	var enc *zstd.Encoder
++	if err == nil {
++		bw = bufio.NewWriterSize(f, 64<<10)
++		enc, err = a.codec.getStream(bw)
++	}
++	for {
++		a.mu.Lock()
++		for len(a.queue) == 0 && !a.finishing {
++			a.cond.Wait()
++		}
++		batch := a.queue
++		a.queue = nil
++		finishing := a.finishing
++		a.mu.Unlock()
++
++		for _, chunk := range batch {
++			if err == nil {
++				_, err = enc.Write(chunk)
++			}
++		}
++		if finishing && len(batch) == 0 {
++			break
++		}
++	}
++	if enc != nil {
++		if cerr := enc.Close(); err == nil {
++			err = cerr
++		}
++		a.codec.putStream(enc)
++	}
++	if bw != nil {
++		if ferr := bw.Flush(); err == nil {
++			err = ferr
++		}
++	}
++	if f != nil {
++		if cerr := f.Close(); err == nil {
++			err = cerr
++		}
++	}
++	a.done <- err
++}
++
++// close 完成压缩并关闭文件；可重复调用。
++func (a *archiveFile) close() error {
++	a.mu.Lock()
++	if a.closed {
++		a.mu.Unlock()
++		return nil
++	}
++	a.closed = true
++	if a.streaming {
++		a.finishing = true
++		a.cond.Signal()
++		a.mu.Unlock()
++		return <-a.done
++	}
++	buf := a.buf
++	a.buf = nil
++	a.mu.Unlock()
++
++	f, err := a.open()
++	if err != nil {
++		return err
++	}
++	out := a.codec.all.EncodeAll(buf, make([]byte, 0, len(buf)/3+64))
++	_, err = f.Write(out)
++	if cerr := f.Close(); err == nil {
++		err = cerr
++	}
++	return err
++}
++
++func (a *archiveFile) rawSize() int64 {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return a.raw
++}
+diff --git a/backend/internal/audit/format.go b/backend/internal/audit/format.go
+new file mode 100644
+index 000000000..0568c9cf6
+--- /dev/null
++++ b/backend/internal/audit/format.go
+@@ -0,0 +1,90 @@
++package audit
++
++import (
++	"encoding/binary"
++	"time"
++)
++
++// 归档文件 = 一个完整的 zstd 流；解压后的内容为：
++//
++//	Magic(8) | Frame*
++//	Frame = Type(1) | Seq(uint16 BE) | Len(uint32 BE) | Payload(Len)
++//
++// 一个文件内可以有多个 section（以 Seq 区分）：客户端两份文件只有 Seq=0，
++// 上游两份文件中每个调度尝试（attempt）占一个 Seq（从 1 开始）。
++// 正文以原始字节分块写入 FrameBody，不做任何改写或截断；
++// section 以 FrameEnd 结束，缺失 FrameEnd 即视为不完整。
++const (
++	fileMagic = "S2AAUD01"
++
++	FrameHeader byte = 'H' // JSON SectionHeader
++	FrameBody   byte = 'B' // 正文原始字节
++	FrameEnd    byte = 'E' // JSON SectionEnd
++	FrameRaw    byte = 'R' // 协议升级（WebSocket 劫持）后的原始连接字节，展示时再解析帧
++	FrameMsg    byte = 'W' // WebSocket 消息：opcode(1) | unixnano(8) | data
++	FrameNote   byte = 'N' // JSON 附注（连接复用、用量回调等）
++
++	frameHeaderSize = 7
++	maxFramePayload = 1 << 20
++)
++
++// 四份文件的类型。
++const (
++	KindClientRequest    = "client_request"
++	KindUpstreamRequest  = "upstream_request"
++	KindUpstreamResponse = "upstream_response"
++	KindClientResponse   = "client_response"
++)
++
++// Kinds 按展示顺序列出四份文件。
++var Kinds = []string{KindClientRequest, KindUpstreamRequest, KindUpstreamResponse, KindClientResponse}
++
++// SectionHeader 描述一段报文的起始信息（Header 已脱敏）。
++type SectionHeader struct {
++	Kind       string              `json:"kind"`
++	Seq        int                 `json:"seq"`
++	Time       time.Time           `json:"time"`
++	Method     string              `json:"method,omitempty"`
++	URL        string              `json:"url,omitempty"`
++	Proto      string              `json:"proto,omitempty"`
++	Host       string              `json:"host,omitempty"`
++	RemoteAddr string              `json:"remote_addr,omitempty"`
++	Status     int                 `json:"status,omitempty"`
++	Header     map[string][]string `json:"header,omitempty"`
++	// Transport: http / sse / websocket
++	Transport string `json:"transport,omitempty"`
++	// Replay 表示传输层（GetBody）重放了请求体，正文为新一轮发送。
++	Replay bool           `json:"replay,omitempty"`
++	Meta   map[string]any `json:"meta,omitempty"`
++}
++
++// SectionEnd 描述一段报文的结束信息。
++type SectionEnd struct {
++	Time  time.Time `json:"time"`
++	Bytes int64     `json:"bytes"`
++	// XXH64 是写入时对正文计算的 xxhash64（请求路径上的廉价完整性校验）；
++	// 面向使用者的 SHA-256 在读取阶段计算。
++	XXH64    string         `json:"xxh64"`
++	Complete bool           `json:"complete"`
++	Error    string         `json:"error,omitempty"`
++	Meta     map[string]any `json:"meta,omitempty"`
++	RawIn    int64          `json:"raw_in,omitempty"`
++	Messages int64          `json:"messages,omitempty"`
++}
++
++func encodeFrameHeader(dst []byte, typ byte, seq uint16, n int) []byte {
++	var h [frameHeaderSize]byte
++	h[0] = typ
++	binary.BigEndian.PutUint16(h[1:3], seq)
++	binary.BigEndian.PutUint32(h[3:7], uint32(n)) //nolint:gosec // n <= maxFramePayload
++	return append(dst, h[:]...)
++}
++
++// WebSocket 消息 opcode（与 RFC 6455 一致）。
++const (
++	WSOpText   byte = 1
++	WSOpBinary byte = 2
++	WSOpClose  byte = 8
++	WSOpPing   byte = 9
++	WSOpPong   byte = 10
++)
+diff --git a/backend/internal/audit/gin.go b/backend/internal/audit/gin.go
+new file mode 100644
+index 000000000..7ceabc8e1
+--- /dev/null
++++ b/backend/internal/audit/gin.go
+@@ -0,0 +1,355 @@
++package audit
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"io"
++	"log/slog"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++)
++
++var (
++	defaultStore atomic.Pointer[Store]
++	defaultOnce  sync.Once
++)
++
++// Init 按 viper 配置（audit.* / AUDIT_*）初始化进程级归档存储，只执行一次。
++// 由服务启动流程在配置加载后调用；未调用 Init 的进程（测试、工具）不会归档。
++func Init() *Store {
++	defaultOnce.Do(func() {
++		cfg := ConfigFromViper()
++		if !cfg.Enabled {
++			slog.Info("audit_archive_disabled")
++			return
++		}
++		s, err := NewStore(cfg)
++		if err != nil {
++			slog.Error("audit_archive_init_failed", "error", err)
++			return
++		}
++		slog.Info("audit_archive_enabled", "root", s.Root())
++		defaultStore.Store(s)
++	})
++	return defaultStore.Load()
++}
++
++// Default 返回进程级归档存储；未初始化、被禁用或初始化失败时返回 nil，所有钩子随之透传。
++func Default() *Store {
++	return defaultStore.Load()
++}
++
++// SetDefault 替换进程级归档存储（测试与自定义装配使用）。
++func SetDefault(s *Store) {
++	defaultOnce.Do(func() {})
++	defaultStore.Store(s)
++}
++
++// Shutdown 等待进程级归档完成落盘。
++func Shutdown(ctx context.Context) error {
++	return defaultStore.Load().Close(ctx)
++}
++
++// IdentityFunc 在请求结束时从 Gin 上下文提取关联字段（API Key、用户、分组、账户等）。
++// 由装配层提供，以免 audit 包依赖业务包。
++type IdentityFunc func(c *gin.Context) map[string]any
++
++// WrapHandler 把归档采集包裹在 next（通常是 ClientRequestID 中间件）外层：
++// 先预置 client_request_id 与归档器到 context，再执行 next（其内部 c.Next() 会跑完
++// 整条业务链），返回后记录客户端响应并收尾。
++func WrapHandler(next gin.HandlerFunc, ident IdentityFunc) gin.HandlerFunc {
++	return func(c *gin.Context) {
++		s := Default()
++		if s == nil || c.Request == nil {
++			next(c)
++			return
++		}
++		s.serve(c, next, ident)
++	}
++}
++
++func (s *Store) serve(c *gin.Context, next gin.HandlerFunc, ident IdentityFunc) {
++	req := c.Request
++	ctx := req.Context()
++	reqID, _ := ctx.Value(ctxkey.ClientRequestID).(string)
++	reqID = strings.TrimSpace(reqID)
++	if reqID == "" {
++		reqID = uuid.New().String()
++		ctx = context.WithValue(ctx, ctxkey.ClientRequestID, reqID)
++	}
++	session, sessionHeader := SessionFromHeader(req.Header, s.cfg.SessionHeaders)
++	now := s.now()
++	rec, err := s.Begin(reqID, session, sessionHeader, now)
++	if err != nil {
++		s.stats.BeginErrors.Add(1)
++		slog.Warn("audit_archive_begin_failed", "request_id", reqID, "error", err)
++		c.Request = req.WithContext(ctx)
++		next(c)
++		return
++	}
++	ti := traceFromRequest(ctx, req.Header)
++	rec.TraceID, rec.SpanID = ti.TraceID, ti.SpanID
++	ctx = WithRecorder(ctx, rec)
++	c.Request = req.WithContext(ctx)
++
++	transport := "http"
++	if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
++		transport = "websocket"
++	}
++	reqSec := rec.startSection(KindClientRequest, SectionHeader{
++		Time:       now,
++		Method:     req.Method,
++		URL:        s.red.URL(req.URL),
++		Proto:      req.Proto,
++		Host:       req.Host,
++		RemoteAddr: req.RemoteAddr,
++		Header:     s.red.Header(req.Header),
++		Transport:  transport,
++		Meta: map[string]any{
++			"request_id":     reqID,
++			"session_id":     session,
++			"session_header": sessionHeader,
++			"trace":          ti,
++		},
++	})
++	var body *teeBody
++	if req.Body != nil && req.Body != http.NoBody {
++		body = &teeBody{ReadCloser: req.Body, sec: reqSec}
++		c.Request.Body = body
++	}
++	w := &respWriter{ResponseWriter: c.Writer, rec: rec, red: s.red, reqSec: reqSec}
++	c.Writer = w
++
++	defer func() {
++		panicked := recover()
++		if c.Writer == w {
++			c.Writer = w.ResponseWriter
++		}
++		s.finishRequest(c, rec, w, body, reqSec, ident, panicked)
++		if panicked != nil {
++			panic(panicked)
++		}
++	}()
++	next(c)
++}
++
++func (s *Store) finishRequest(c *gin.Context, rec *Recorder, w *respWriter, body *teeBody, reqSec *section, ident IdentityFunc, panicked any) {
++	meta := map[string]any{}
++	if ident != nil {
++		func() {
++			defer func() { _ = recover() }()
++			for k, v := range ident(c) {
++				meta[k] = v
++			}
++		}()
++	}
++	if id, _ := c.Request.Context().Value(ctxkey.ClientRequestID).(string); id != "" && id != rec.ID {
++		meta["client_request_id_final"] = id
++	}
++	meta["attempts"] = rec.Attempts()
++	meta["duration_ms"] = time.Since(rec.Started).Milliseconds()
++	if len(c.Errors) > 0 {
++		meta["gin_errors"] = c.Errors.String()
++	}
++	if panicked != nil {
++		meta["panic"] = true
++	}
++
++	// 客户端请求
++	reqComplete, reqErr := true, ""
++	if body != nil {
++		reqComplete, reqErr = body.state()
++	}
++	reqSec.end(reqComplete, reqErr, nil)
++
++	// 客户端响应
++	w.ensureHeader()
++	complete := panicked == nil && c.Request.Context().Err() == nil
++	errText := ""
++	if !complete {
++		if panicked != nil {
++			errText = "handler panic"
++		} else {
++			errText = "client context: " + c.Request.Context().Err().Error()
++		}
++	}
++	if w.hijacked.Load() {
++		meta["hijacked"] = true
++	}
++	meta["status"] = w.Status()
++	meta["response_size"] = w.Size()
++	w.sec().end(complete, errText, meta)
++	rec.Finish()
++}
++
++// teeBody 在业务读取请求体的同时复制到归档；不提前读取，不改变读取行为。
++type teeBody struct {
++	io.ReadCloser
++	sec    *section
++	mu     sync.Mutex
++	eof    bool
++	err    error
++	closed bool
++}
++
++func (t *teeBody) Read(p []byte) (int, error) {
++	n, err := t.ReadCloser.Read(p)
++	if n > 0 {
++		t.sec.body(p[:n])
++	}
++	if err != nil {
++		t.mu.Lock()
++		if errors.Is(err, io.EOF) {
++			t.eof = true
++		} else if t.err == nil {
++			t.err = err
++		}
++		t.mu.Unlock()
++	}
++	return n, err
++}
++
++func (t *teeBody) Close() error {
++	t.mu.Lock()
++	t.closed = true
++	t.mu.Unlock()
++	return t.ReadCloser.Close()
++}
++
++func (t *teeBody) state() (bool, string) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	switch {
++	case t.eof:
++		return true, ""
++	case t.err != nil:
++		return false, "read error: " + t.err.Error()
++	default:
++		return false, "request body not fully consumed by handler"
++	}
++}
++
++// respWriter 复制写给客户端的响应头与正文；WebSocket 劫持后复制原始连接字节。
++type respWriter struct {
++	gin.ResponseWriter
++	rec      *Recorder
++	red      *redactor
++	reqSec   *section
++	once     sync.Once
++	mu       sync.Mutex
++	section  *section
++	hijacked atomic.Bool
++}
++
++func (w *respWriter) sec() *section {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return w.section
++}
++
++func (w *respWriter) snapshotHeader(status int, extra map[string]any) {
++	w.once.Do(func() {
++		h := w.Header()
++		transport := "http"
++		if strings.HasPrefix(strings.ToLower(h.Get("Content-Type")), "text/event-stream") {
++			transport = "sse"
++		}
++		if status == http.StatusSwitchingProtocols || w.hijacked.Load() {
++			transport = "websocket"
++		}
++		sec := w.rec.startSection(KindClientResponse, SectionHeader{
++			Status:    status,
++			Header:    w.red.Header(h),
++			Transport: transport,
++			Meta:      extra,
++		})
++		w.mu.Lock()
++		w.section = sec
++		w.mu.Unlock()
++	})
++}
++
++func (w *respWriter) ensureHeader() {
++	w.snapshotHeader(w.Status(), map[string]any{"header_snapshot": "at_finish"})
++}
++
++func (w *respWriter) WriteHeaderNow() {
++	w.snapshotHeader(w.Status(), nil)
++	w.ResponseWriter.WriteHeaderNow()
++}
++
++func (w *respWriter) Write(p []byte) (int, error) {
++	w.snapshotHeader(w.Status(), nil)
++	n, err := w.ResponseWriter.Write(p)
++	if n > 0 {
++		w.sec().body(p[:n])
++	}
++	return n, err
++}
++
++func (w *respWriter) WriteString(str string) (int, error) {
++	w.snapshotHeader(w.Status(), nil)
++	n, err := w.ResponseWriter.WriteString(str)
++	if n > 0 {
++		w.sec().body([]byte(str[:n]))
++	}
++	return n, err
++}
++
++// Unwrap 支持 http.ResponseController。
++func (w *respWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
++
++// Hijack 劫持后：客户端→服务端的原始字节追加到 client_request，
++// 服务端→客户端的原始字节追加到 client_response（FrameRaw），展示时再解析 WS 帧。
++func (w *respWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	conn, brw, err := w.ResponseWriter.Hijack()
++	if err != nil {
++		return conn, brw, err
++	}
++	w.hijacked.Store(true)
++	w.snapshotHeader(w.Status(), map[string]any{"hijacked": true})
++	tc := &teeConn{Conn: conn, in: w.reqSec, out: w.sec()}
++	if brw == nil {
++		return tc, brw, nil
++	}
++	// 劫持前已被 http.Server 缓冲的客户端字节同样属于入站流。
++	if n := brw.Reader.Buffered(); n > 0 {
++		if b, perr := brw.Peek(n); perr == nil {
++			tc.in.raw(b)
++		}
++	}
++	// 原 Writer 直接写底层连接，替换为写入 teeConn 的新 Writer；先冲刷遗留数据。
++	_ = brw.Flush()
++	return tc, bufio.NewReadWriter(brw.Reader, bufio.NewWriterSize(tc, brw.Writer.Size())), nil
++}
++
++type teeConn struct {
++	net.Conn
++	in  *section
++	out *section
++}
++
++func (t *teeConn) Read(p []byte) (int, error) {
++	n, err := t.Conn.Read(p)
++	if n > 0 {
++		t.in.raw(p[:n])
++	}
++	return n, err
++}
++
++func (t *teeConn) Write(p []byte) (int, error) {
++	n, err := t.Conn.Write(p)
++	if n > 0 {
++		t.out.raw(p[:n])
++	}
++	return n, err
++}
+diff --git a/backend/internal/audit/reader.go b/backend/internal/audit/reader.go
+new file mode 100644
+index 000000000..abda348a7
+--- /dev/null
++++ b/backend/internal/audit/reader.go
+@@ -0,0 +1,458 @@
++package audit
++
++import (
++	"bufio"
++	"bytes"
++	"compress/flate"
++	"compress/gzip"
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"hash"
++	"io"
++	"io/fs"
++	"os"
++	"strings"
++	"time"
++	"unicode/utf8"
++
++	"github.com/andybalholm/brotli"
++	"github.com/cespare/xxhash/v2"
++	"github.com/klauspost/compress/zstd"
++)
++
++// ErrNotArchive 表示文件不是本归档格式。
++var ErrNotArchive = errors.New("audit: not an archive file")
++
++// newDecoder 在内存中流式解压，不产生临时文件。
++func newDecoder(r io.Reader) (*zstd.Decoder, error) {
++	return zstd.NewReader(r,
++		zstd.WithDecoderConcurrency(1),
++		zstd.WithDecoderLowmem(true),
++		zstd.WithDecoderMaxWindow(64<<20),
++	)
++}
++
++// frameReader 顺序读取解压后的帧。
++type frameReader struct {
++	r   *bufio.Reader
++	hdr [frameHeaderSize]byte
++}
++
++type frame struct {
++	typ     byte
++	seq     uint16
++	payload []byte
++}
++
++func openFrames(r io.Reader) (*frameReader, error) {
++	br := bufio.NewReaderSize(r, 64<<10)
++	magic := make([]byte, len(fileMagic))
++	if _, err := io.ReadFull(br, magic); err != nil {
++		if errors.Is(err, io.EOF) {
++			return nil, io.EOF
++		}
++		return nil, err
++	}
++	if string(magic) != fileMagic {
++		return nil, ErrNotArchive
++	}
++	return &frameReader{r: br}, nil
++}
++
++// next 读取一帧；payload 复用 buf。返回 io.EOF 表示正常结束，io.ErrUnexpectedEOF 表示截断。
++func (fr *frameReader) next(buf []byte) (frame, error) {
++	if _, err := io.ReadFull(fr.r, fr.hdr[:]); err != nil {
++		if errors.Is(err, io.EOF) {
++			return frame{}, io.EOF
++		}
++		return frame{}, io.ErrUnexpectedEOF
++	}
++	n := int(binary.BigEndian.Uint32(fr.hdr[3:7]))
++	if n > maxFramePayload+16 {
++		return frame{}, fmt.Errorf("audit: frame too large (%d)", n)
++	}
++	if cap(buf) < n {
++		buf = make([]byte, n)
++	}
++	buf = buf[:n]
++	if _, err := io.ReadFull(fr.r, buf); err != nil {
++		return frame{}, io.ErrUnexpectedEOF
++	}
++	return frame{typ: fr.hdr[0], seq: binary.BigEndian.Uint16(fr.hdr[1:3]), payload: buf}, nil
++}
++
++// FileView 是单个归档文件的展示视图。
++type FileView struct {
++	Kind           string           `json:"kind"`
++	Exists         bool             `json:"exists"`
++	CompressedSize int64            `json:"compressed_size"`
++	RawSize        int64            `json:"raw_size"`
++	Status         string           `json:"status"` // ok / missing / empty / truncated / corrupt
++	Error          string           `json:"error,omitempty"`
++	Sections       []*SectionView   `json:"sections"`
++	Notes          []map[string]any `json:"notes,omitempty"`
++}
++
++// SectionView 是一段报文的展示视图。
++type SectionView struct {
++	Index    int           `json:"index"`
++	Seq      int           `json:"seq"`
++	Header   SectionHeader `json:"header"`
++	End      *SectionEnd   `json:"end,omitempty"`
++	Complete bool          `json:"complete"`
++	// BodyBytes / BodySHA256 为读取时计算的值；HashMatch 以写入时记录的字节数与 xxhash64 比对。
++	BodyBytes         int64       `json:"body_bytes"`
++	BodySHA256        string      `json:"body_sha256"`
++	HashMatch         *bool       `json:"hash_match,omitempty"`
++	Body              *BodyView   `json:"body,omitempty"`
++	Messages          []WSMessage `json:"messages,omitempty"`
++	MessagesTruncated bool        `json:"messages_truncated,omitempty"`
++	RawBytes          int64       `json:"raw_bytes,omitempty"`
++
++	hash     hash.Hash
++	xxh      *xxhash.Digest
++	rawBody  []byte
++	rawConn  []byte
++	limit    int
++	overflow bool
++}
++
++// BodyView 是正文的展示形态（仅在展示阶段解析）。
++type BodyView struct {
++	ContentEncoding string     `json:"content_encoding,omitempty"`
++	Decoded         bool       `json:"decoded"`
++	DecodeError     string     `json:"decode_error,omitempty"`
++	IsText          bool       `json:"is_text"`
++	Text            string     `json:"text,omitempty"`
++	Base64          []byte     `json:"base64,omitempty"`
++	TruncatedForUI  bool       `json:"truncated_for_display"`
++	SSE             []SSEEvent `json:"sse,omitempty"`
++	SSEDone         *bool      `json:"sse_terminated,omitempty"`
++}
++
++// SSEEvent 是解析后的一个 SSE 事件。
++type SSEEvent struct {
++	Event string `json:"event,omitempty"`
++	ID    string `json:"id,omitempty"`
++	Data  string `json:"data"`
++}
++
++// WSMessage 是一条 WebSocket 消息。
++type WSMessage struct {
++	Dir        string    `json:"dir"` // in / out（相对写入方）
++	Op         string    `json:"op"`
++	Time       time.Time `json:"time,omitempty"`
++	Size       int       `json:"size"`
++	Compressed bool      `json:"compressed,omitempty"`
++	Text       string    `json:"text,omitempty"`
++	Base64     []byte    `json:"base64,omitempty"`
++	Error      string    `json:"error,omitempty"`
++}
++
++// ReadFile 解析一个归档文件。displayLimit 限制每段保留用于展示的正文字节，
++// 超出部分仍参与计数与哈希校验，可通过下载接口完整获取。
++func ReadFile(path, kind string, displayLimit int) *FileView {
++	fv := &FileView{Kind: kind, Sections: []*SectionView{}}
++	st, err := os.Stat(path)
++	if errors.Is(err, fs.ErrNotExist) {
++		fv.Status = "missing"
++		return fv
++	}
++	if err != nil {
++		fv.Status, fv.Error = "error", err.Error()
++		return fv
++	}
++	fv.Exists = true
++	fv.CompressedSize = st.Size()
++	if st.Size() == 0 {
++		// 文件已创建但尚未落盘：请求仍在进行，或进程在落盘前退出。
++		fv.Status = "empty"
++		return fv
++	}
++	f, err := os.Open(path) //nolint:gosec // 路径已由 FilePath 校验
++	if err != nil {
++		fv.Status, fv.Error = "error", err.Error()
++		return fv
++	}
++	defer func() { _ = f.Close() }()
++	dec, err := newDecoder(f)
++	if err != nil {
++		fv.Status, fv.Error = "corrupt", err.Error()
++		return fv
++	}
++	defer dec.Close()
++	counter := &countingReader{r: dec}
++	fr, err := openFrames(counter)
++	if err != nil {
++		fv.Status, fv.Error = "corrupt", err.Error()
++		return fv
++	}
++	latest := map[uint16]*SectionView{}
++	var buf []byte
++	fv.Status = "ok"
++	for {
++		fr2, err := fr.next(buf)
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			fv.Status, fv.Error = "truncated", err.Error()
++			break
++		}
++		buf = fr2.payload[:0]
++		switch fr2.typ {
++		case FrameHeader:
++			sv := &SectionView{Index: len(fv.Sections), Seq: int(fr2.seq), hash: sha256.New(), xxh: xxhash.New(), limit: displayLimit}
++			if err := json.Unmarshal(fr2.payload, &sv.Header); err != nil {
++				sv.Header.Kind = kind
++			}
++			fv.Sections = append(fv.Sections, sv)
++			latest[fr2.seq] = sv
++		case FrameNote:
++			var note map[string]any
++			if json.Unmarshal(fr2.payload, &note) == nil {
++				fv.Notes = append(fv.Notes, note)
++			}
++		default:
++			sv := latest[fr2.seq]
++			if sv == nil {
++				continue
++			}
++			sv.consume(fr2)
++		}
++	}
++	fv.RawSize = counter.n
++	if fv.Status == "ok" && counter.err != nil && !errors.Is(counter.err, io.EOF) {
++		fv.Status, fv.Error = "truncated", counter.err.Error()
++	}
++	for _, sv := range fv.Sections {
++		sv.finalize()
++	}
++	return fv
++}
++
++type countingReader struct {
++	r   io.Reader
++	n   int64
++	err error
++}
++
++func (c *countingReader) Read(p []byte) (int, error) {
++	n, err := c.r.Read(p)
++	c.n += int64(n)
++	if err != nil {
++		c.err = err
++	}
++	return n, err
++}
++
++func (sv *SectionView) consume(f frame) {
++	switch f.typ {
++	case FrameBody:
++		_, _ = sv.hash.Write(f.payload)
++		_, _ = sv.xxh.Write(f.payload)
++		sv.BodyBytes += int64(len(f.payload))
++		if room := sv.limit - len(sv.rawBody); room > 0 {
++			n := len(f.payload)
++			if n > room {
++				n = room
++				sv.overflow = true
++			}
++			sv.rawBody = append(sv.rawBody, f.payload[:n]...)
++		} else {
++			sv.overflow = true
++		}
++	case FrameRaw:
++		sv.RawBytes += int64(len(f.payload))
++		if room := sv.limit - len(sv.rawConn); room > 0 {
++			n := min(len(f.payload), room)
++			sv.rawConn = append(sv.rawConn, f.payload[:n]...)
++			if n < len(f.payload) {
++				sv.overflow = true
++			}
++		} else {
++			sv.overflow = true
++		}
++	case FrameMsg:
++		if len(f.payload) < 9 {
++			return
++		}
++		if len(sv.Messages) >= 5000 {
++			sv.MessagesTruncated = true
++			return
++		}
++		data := f.payload[9:]
++		m := WSMessage{
++			Op:   opName(f.payload[0]),
++			Time: time.Unix(0, int64(binary.BigEndian.Uint64(f.payload[1:9]))), //nolint:gosec // 写入时为正数
++			Size: len(data),
++		}
++		setPayload(&m.Text, &m.Base64, data, 256<<10)
++		sv.Messages = append(sv.Messages, m)
++	case FrameEnd:
++		var e SectionEnd
++		if json.Unmarshal(f.payload, &e) == nil {
++			sv.End = &e
++		}
++	}
++}
++
++func (sv *SectionView) finalize() {
++	sv.BodySHA256 = hex.EncodeToString(sv.hash.Sum(nil))
++	if sv.End != nil {
++		sv.Complete = sv.End.Complete
++		match := sv.End.Bytes == sv.BodyBytes && sv.End.XXH64 == xxh64Hex(sv.xxh.Sum64())
++		sv.HashMatch = &match
++	}
++	if sv.BodyBytes > 0 {
++		sv.Body = buildBodyView(sv.Header, sv.rawBody, sv.overflow)
++	}
++	sv.rawBody = nil
++}
++
++func setPayload(text *string, b64 *[]byte, data []byte, limit int) {
++	if len(data) > limit {
++		data = data[:limit]
++	}
++	if utf8.Valid(data) {
++		*text = string(data)
++	} else {
++		*b64 = append([]byte(nil), data...)
++	}
++}
++
++func opName(op byte) string {
++	switch op {
++	case WSOpText:
++		return "text"
++	case WSOpBinary:
++		return "binary"
++	case WSOpClose:
++		return "close"
++	case WSOpPing:
++		return "ping"
++	case WSOpPong:
++		return "pong"
++	case 0:
++		return "continuation"
++	default:
++		return fmt.Sprintf("op_%d", op)
++	}
++}
++
++func headerValue(h map[string][]string, key string) string {
++	for k, vs := range h {
++		if strings.EqualFold(k, key) && len(vs) > 0 {
++			return vs[0]
++		}
++	}
++	return ""
++}
++
++// buildBodyView 解码 Content-Encoding（仅展示用途），并解析 SSE。
++func buildBodyView(h SectionHeader, raw []byte, overflow bool) *BodyView {
++	bv := &BodyView{TruncatedForUI: overflow}
++	enc := strings.ToLower(strings.TrimSpace(headerValue(h.Header, "Content-Encoding")))
++	data := raw
++	if enc != "" && enc != "identity" {
++		bv.ContentEncoding = enc
++		decoded, err := decodeContent(enc, raw, 4*len(raw)+(1<<20))
++		if err != nil && len(decoded) == 0 {
++			bv.DecodeError = err.Error()
++		} else {
++			bv.Decoded = true
++			if err != nil {
++				bv.DecodeError = "partial: " + err.Error()
++			}
++			data = decoded
++		}
++	}
++	if utf8.Valid(data) || (overflow && utf8.Valid(trimIncompleteRune(data))) {
++		bv.IsText = true
++		bv.Text = string(data)
++	} else {
++		bv.Base64 = data
++	}
++	ct := strings.ToLower(headerValue(h.Header, "Content-Type"))
++	if bv.IsText && (strings.HasPrefix(ct, "text/event-stream") || h.Transport == "sse") {
++		bv.SSE, bv.SSEDone = parseSSE(bv.Text)
++	}
++	return bv
++}
++
++func trimIncompleteRune(b []byte) []byte {
++	for i := 0; i < 4 && len(b) > 0; i++ {
++		if utf8.Valid(b) {
++			return b
++		}
++		b = b[:len(b)-1]
++	}
++	return b
++}
++
++// DecodeReader 返回 Content-Encoding 解码读取器（内存流式）。
++func DecodeReader(enc string, r io.Reader) (io.ReadCloser, error) {
++	switch strings.ToLower(strings.TrimSpace(enc)) {
++	case "gzip", "x-gzip":
++		return gzip.NewReader(r)
++	case "deflate":
++		return flate.NewReader(r), nil
++	case "br":
++		return io.NopCloser(brotli.NewReader(r)), nil
++	case "zstd":
++		d, err := newDecoder(r)
++		if err != nil {
++			return nil, err
++		}
++		return d.IOReadCloser(), nil
++	default:
++		return nil, fmt.Errorf("unsupported content-encoding %q", enc)
++	}
++}
++
++func decodeContent(enc string, raw []byte, limit int) ([]byte, error) {
++	rc, err := DecodeReader(enc, bytes.NewReader(raw))
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = rc.Close() }()
++	out, err := io.ReadAll(io.LimitReader(rc, int64(limit)))
++	return out, err
++}
++
++func parseSSE(text string) ([]SSEEvent, *bool) {
++	var events []SSEEvent
++	done := false
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	for _, block := range strings.Split(text, "\n\n") {
++		if strings.TrimSpace(block) == "" {
++			continue
++		}
++		var ev SSEEvent
++		var data []string
++		for _, line := range strings.Split(block, "\n") {
++			switch {
++			case strings.HasPrefix(line, "event:"):
++				ev.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
++			case strings.HasPrefix(line, "id:"):
++				ev.ID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
++			case strings.HasPrefix(line, "data:"):
++				data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
++			}
++		}
++		ev.Data = strings.Join(data, "\n")
++		if ev.Data == "[DONE]" || ev.Event == "message_stop" || ev.Event == "response.completed" || ev.Event == "response.done" ||
++			strings.Contains(ev.Data, `"finishReason"`) {
++			done = true
++		}
++		events = append(events, ev)
++		if len(events) >= 20000 {
++			break
++		}
++	}
++	return events, &done
++}
+diff --git a/backend/internal/audit/recorder.go b/backend/internal/audit/recorder.go
+new file mode 100644
+index 000000000..e20dd3a5b
+--- /dev/null
++++ b/backend/internal/audit/recorder.go
+@@ -0,0 +1,291 @@
++package audit
++
++import (
++	"context"
++	"encoding/binary"
++	"encoding/json"
++	"log/slog"
++	"maps"
++	"os"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/cespare/xxhash/v2"
++)
++
++func xxh64Hex(v uint64) string {
++	s := strconv.FormatUint(v, 16)
++	for len(s) < 16 {
++		s = "0" + s
++	}
++	return s
++}
++
++type ctxKey struct{}
++
++// WithRecorder 把请求归档器放入 context，供 RoundTripper / WS Tap / OnUsage 查找。
++func WithRecorder(ctx context.Context, r *Recorder) context.Context {
++	return context.WithValue(ctx, ctxKey{}, r)
++}
++
++// FromContext 取出请求归档器；未启用归档时返回 nil。
++func FromContext(ctx context.Context) *Recorder {
++	if ctx == nil {
++		return nil
++	}
++	r, _ := ctx.Value(ctxKey{}).(*Recorder)
++	return r
++}
++
++// Recorder 是单个客户端请求的归档器（四个文件）。
++type Recorder struct {
++	store         *Store
++	ID            string
++	Session       string
++	SessionHeader string
++	TraceID       string
++	sessDir       string
++	SpanID        string
++	Started       time.Time
++
++	files    [4]*archiveFile
++	attempts atomic.Int32
++	finished atomic.Bool
++
++	mu     sync.Mutex
++	open   map[*section]struct{}
++	lastWS int32
++	ref    string
++	usage  []IndexEntry // 结束前收到的用量回调，落盘时写入索引
++
++	filesOnce sync.Once
++	filesRes  [4]*os.File
++	filesErr  error
++}
++
++// ArchiveRef 返回归档位置（相对根目录）；文件尚未创建时为空。
++func (r *Recorder) ArchiveRef() string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.ref
++}
++
++func (r *Recorder) file(kind string) *archiveFile {
++	for i, k := range Kinds {
++		if k == kind {
++			return r.files[i]
++		}
++	}
++	return nil
++}
++
++// NextAttempt 分配一个上游调度尝试序号（从 1 开始）。
++func (r *Recorder) NextAttempt() int {
++	return int(r.attempts.Add(1))
++}
++
++// Attempts 返回已分配的尝试数。
++func (r *Recorder) Attempts() int { return int(r.attempts.Load()) }
++
++// section 是文件内一段报文的写入句柄，负责字节计数与 xxhash64。
++type section struct {
++	rec      *Recorder
++	file     *archiveFile
++	seq      uint16
++	mu       sync.Mutex
++	h        *xxhash.Digest
++	n        int64
++	rawIn    int64
++	messages int64
++	ended    bool
++}
++
++func (r *Recorder) startSection(kind string, hdr SectionHeader) *section {
++	if r == nil || r.finished.Load() {
++		return nil
++	}
++	f := r.file(kind)
++	if f == nil {
++		return nil
++	}
++	hdr.Kind = kind
++	if hdr.Time.IsZero() {
++		hdr.Time = time.Now()
++	}
++	payload, err := json.Marshal(hdr)
++	if err != nil {
++		return nil
++	}
++	seq := uint16(hdr.Seq) //nolint:gosec // attempts are bounded far below 65535
++	if err := f.writeFrame(FrameHeader, seq, payload); err != nil {
++		r.store.stats.DroppedWrites.Add(1)
++		return nil
++	}
++	s := &section{rec: r, file: f, seq: seq, h: xxhash.New()}
++	r.mu.Lock()
++	r.open[s] = struct{}{}
++	r.mu.Unlock()
++	return s
++}
++
++func (s *section) body(p []byte) {
++	if s == nil || len(p) == 0 {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.ended {
++		return
++	}
++	if err := s.file.writeFrame(FrameBody, s.seq, p); err != nil {
++		s.rec.store.stats.DroppedWrites.Add(1)
++		return
++	}
++	_, _ = s.h.Write(p)
++	s.n += int64(len(p))
++}
++
++// raw 记录协议升级后的原始连接字节（不计入正文哈希）。
++func (s *section) raw(p []byte) {
++	if s == nil || len(p) == 0 {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.ended {
++		return
++	}
++	if err := s.file.writeFrame(FrameRaw, s.seq, p); err != nil {
++		s.rec.store.stats.DroppedWrites.Add(1)
++		return
++	}
++	s.rawIn += int64(len(p))
++}
++
++// message 记录一条 WebSocket 消息。
++func (s *section) message(op byte, data []byte) {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.ended {
++		return
++	}
++	buf := make([]byte, 9+len(data))
++	buf[0] = op
++	binary.BigEndian.PutUint64(buf[1:9], uint64(time.Now().UnixNano())) //nolint:gosec // 时间戳为正
++	copy(buf[9:], data)
++	if err := s.file.writeFrame(FrameMsg, s.seq, buf); err != nil {
++		s.rec.store.stats.DroppedWrites.Add(1)
++		return
++	}
++	s.messages++
++}
++
++func (s *section) end(complete bool, errText string, meta map[string]any) {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	if s.ended {
++		s.mu.Unlock()
++		return
++	}
++	s.ended = true
++	e := SectionEnd{
++		Time:     time.Now(),
++		Bytes:    s.n,
++		XXH64:    xxh64Hex(s.h.Sum64()),
++		Complete: complete,
++		Error:    errText,
++		Meta:     meta,
++		RawIn:    s.rawIn,
++		Messages: s.messages,
++	}
++	payload, _ := json.Marshal(e)
++	if err := s.file.writeFrame(FrameEnd, s.seq, payload); err != nil {
++		s.rec.store.stats.DroppedWrites.Add(1)
++	}
++	s.mu.Unlock()
++
++	s.rec.mu.Lock()
++	delete(s.rec.open, s)
++	s.rec.mu.Unlock()
++}
++
++// Note 追加一条附注到客户端响应文件（例如 WS 连接复用、用量回调）。
++func (r *Recorder) Note(kind string, seq int, note map[string]any) {
++	if r == nil || r.finished.Load() {
++		return
++	}
++	f := r.file(kind)
++	if f == nil {
++		return
++	}
++	note = maps.Clone(note)
++	if note == nil {
++		note = map[string]any{}
++	}
++	note["time"] = time.Now()
++	payload, err := json.Marshal(note)
++	if err != nil {
++		return
++	}
++	if f.writeFrame(FrameNote, uint16(seq), payload) != nil { //nolint:gosec // bounded
++		r.store.stats.DroppedWrites.Add(1)
++	}
++}
++
++// Finish 结束归档：未结束的 section 标记为不完整，随后在后台创建文件、
++// 完成压缩落盘并写索引，不阻塞客户端响应的收尾。
++func (r *Recorder) Finish() {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	if r.finished.Load() {
++		r.mu.Unlock()
++		return
++	}
++	r.finished.Store(true)
++	open := make([]*section, 0, len(r.open))
++	for s := range r.open {
++		open = append(open, s)
++	}
++	usage := r.usage
++	r.usage = nil
++	r.mu.Unlock()
++	for _, s := range open {
++		s.end(false, "archive finalized before stream closed", nil)
++	}
++	r.store.stats.FlushBacklog.Add(1)
++	go func() {
++		defer r.store.pending.Done()
++		// 有界并发：限制同时创建/写入的文件数，突发流量下排队而不是耗尽文件句柄。
++		r.store.flushSem <- struct{}{}
++		r.store.stats.FlushBacklog.Add(-1)
++		defer func() { <-r.store.flushSem }()
++		if _, err := r.ensureFiles(); err == nil {
++			ref := r.ArchiveRef()
++			for _, e := range usage {
++				e.Ref = ref
++				r.store.writeUsageIndex(e)
++			}
++		}
++		var raw int64
++		for _, f := range r.files {
++			raw += f.rawSize()
++			if err := f.close(); err != nil {
++				r.store.stats.CloseErrors.Add(1)
++				slog.Warn("audit_archive_close_failed", "request_id", r.ID, "error", err)
++			}
++		}
++		r.store.stats.RawBytes.Add(raw)
++	}()
++}
++
++// Finished 表示归档已结束（之后的写入将被丢弃并计数）。
++func (r *Recorder) Finished() bool { return r == nil || r.finished.Load() }
+diff --git a/backend/internal/audit/redact.go b/backend/internal/audit/redact.go
+new file mode 100644
+index 000000000..d19410882
+--- /dev/null
++++ b/backend/internal/audit/redact.go
+@@ -0,0 +1,128 @@
++package audit
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// redactor 只处理鉴权类 Header / 查询参数，且只作用于归档副本，绝不修改真实请求。
++type redactor struct {
++	headers map[string]struct{}
++	query   map[string]struct{}
++}
++
++func newRedactor(cfg Config) *redactor {
++	q := make(map[string]struct{}, len(cfg.RedactQueryParams))
++	for _, p := range cfg.RedactQueryParams {
++		if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
++			q[p] = struct{}{}
++		}
++	}
++	return &redactor{headers: canonicalSet(cfg.RedactHeaders), query: q}
++}
++
++// MaskSecret 保留前后各 4 位，中间以 * 替换；长度不足 9 时全部遮蔽，
++// 以保证原值不会通过前后缀拼回。对 "Bearer xxx" 这类带方案前缀的值只遮蔽凭据部分。
++func MaskSecret(value string) string {
++	if value == "" {
++		return ""
++	}
++	scheme := ""
++	cred := value
++	if i := strings.IndexByte(value, ' '); i > 0 && i < 16 && !strings.ContainsAny(value[:i], "=;,") {
++		scheme, cred = value[:i+1], value[i+1:]
++	}
++	return scheme + maskToken(cred)
++}
++
++func maskToken(v string) string {
++	r := []rune(v)
++	if len(r) <= 8 {
++		return strings.Repeat("*", len(r))
++	}
++	return string(r[:4]) + strings.Repeat("*", len(r)-8) + string(r[len(r)-4:])
++}
++
++// Header 返回脱敏后的 Header 副本（多值保持顺序）。
++func (r *redactor) Header(h http.Header) map[string][]string {
++	out := make(map[string][]string, len(h))
++	for k, vs := range h {
++		cp := make([]string, len(vs))
++		_, sensitive := r.headers[strings.ToLower(k)]
++		for i, v := range vs {
++			if sensitive {
++				cp[i] = r.maskHeaderValue(k, v)
++			} else {
++				cp[i] = v
++			}
++		}
++		out[k] = cp
++	}
++	return out
++}
++
++func (r *redactor) maskHeaderValue(key, v string) string {
++	switch strings.ToLower(key) {
++	case "cookie":
++		return maskPairs(v, ";", "=")
++	case "set-cookie":
++		// 仅遮蔽 name=value 的 value，保留属性（Path/Expires 等）。
++		parts := strings.SplitN(v, ";", 2)
++		masked := maskPairs(parts[0], ";", "=")
++		if len(parts) == 2 {
++			return masked + ";" + parts[1]
++		}
++		return masked
++	default:
++		return MaskSecret(v)
++	}
++}
++
++func maskPairs(v, sep, kv string) string {
++	items := strings.Split(v, sep)
++	for i, item := range items {
++		if j := strings.Index(item, kv); j >= 0 {
++			items[i] = item[:j+1] + maskToken(item[j+1:])
++		} else {
++			items[i] = maskToken(item)
++		}
++	}
++	return strings.Join(items, sep)
++}
++
++// URL 返回脱敏后的 URL 字符串；仅替换鉴权类查询参数，其余原样保留（含编码与顺序）。
++func (r *redactor) URL(u *url.URL) string {
++	if u == nil {
++		return ""
++	}
++	if u.RawQuery == "" || len(r.query) == 0 {
++		return u.String()
++	}
++	parts := strings.Split(u.RawQuery, "&")
++	changed := false
++	for i, p := range parts {
++		name, val, ok := strings.Cut(p, "=")
++		if !ok {
++			continue
++		}
++		decoded, err := url.QueryUnescape(name)
++		if err != nil {
++			decoded = name
++		}
++		if _, hit := r.query[strings.ToLower(decoded)]; hit {
++			raw, err := url.QueryUnescape(val)
++			if err != nil {
++				raw = val
++			}
++			parts[i] = name + "=" + url.QueryEscape(maskToken(raw))
++			changed = true
++		}
++	}
++	if !changed {
++		return u.String()
++	}
++	cp := *u
++	cp.RawQuery = strings.Join(parts, "&")
++	return cp.String()
++}
+diff --git a/backend/internal/audit/session.go b/backend/internal/audit/session.go
+new file mode 100644
+index 000000000..c737b5f60
+--- /dev/null
++++ b/backend/internal/audit/session.go
+@@ -0,0 +1,179 @@
++package audit
++
++import (
++	"container/list"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io/fs"
++	"net/http"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++)
++
++// NoSessionDir 是无会话请求共用的目录名（位于当天日期目录下）。
++const NoSessionDir = "nosession"
++
++var safeNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`)
++
++// safeName 把任意外部 ID 映射为安全的单级文件名：
++// 合法字符的原样保留，否则（或与保留名冲突时）使用 "h-" + sha256 前缀。
++func safeName(id string) string {
++	id = strings.TrimSpace(id)
++	if safeNameRE.MatchString(id) && id != NoSessionDir && !strings.Contains(id, "..") {
++		return id
++	}
++	sum := sha256.Sum256([]byte(id))
++	return "h-" + hex.EncodeToString(sum[:16])
++}
++
++func hashKey(id string) string {
++	sum := sha256.Sum256([]byte(id))
++	return hex.EncodeToString(sum[:])
++}
++
++// SessionFromHeader 按配置的优先级读取会话 ID。
++func SessionFromHeader(h http.Header, names []string) (string, string) {
++	for _, name := range names {
++		if v := strings.TrimSpace(h.Get(name)); v != "" {
++			return v, name
++		}
++		// Go 会把 session_id 规范化为 Session_id，部分代理会保留原始大小写：兜底精确匹配。
++		if vs, ok := h[name]; ok && len(vs) > 0 && strings.TrimSpace(vs[0]) != "" {
++			return strings.TrimSpace(vs[0]), name
++		}
++	}
++	return "", ""
++}
++
++func dateDir(t time.Time) string {
++	return t.Format("2006-01") + "/" + t.Format("02")
++}
++
++// sessionDirs 把会话固定到首次出现的日期目录。
++//
++// 持久化：.sessions/<sha256[:2]>/<sha256> 标记文件记录首个日期目录，
++// 以 link(2) 原子创建，重启后 O(1) 读取，不扫描任何历史目录；
++// 内存中只保留有界 LRU 缓存。
++type sessionDirs struct {
++	root  string
++	cap   int
++	mu    sync.Mutex
++	ll    *list.List
++	items map[string]*list.Element
++}
++
++type sessionEntry struct {
++	key string
++	dir string
++}
++
++func newSessionDirs(root string, capacity int) *sessionDirs {
++	if capacity <= 0 {
++		capacity = 10000
++	}
++	return &sessionDirs{root: root, cap: capacity, ll: list.New(), items: make(map[string]*list.Element)}
++}
++
++func (d *sessionDirs) cached(key string) (string, bool) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if el, ok := d.items[key]; ok {
++		if e, ok := el.Value.(*sessionEntry); ok {
++			d.ll.MoveToFront(el)
++			return e.dir, true
++		}
++	}
++	return "", false
++}
++
++func (d *sessionDirs) remember(key, dir string) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if el, ok := d.items[key]; ok {
++		if e, ok := el.Value.(*sessionEntry); ok {
++			e.dir = dir
++		}
++		d.ll.MoveToFront(el)
++		return
++	}
++	d.items[key] = d.ll.PushFront(&sessionEntry{key: key, dir: dir})
++	for d.ll.Len() > d.cap {
++		last := d.ll.Back()
++		d.ll.Remove(last)
++		if e, ok := last.Value.(*sessionEntry); ok {
++			delete(d.items, e.key)
++		}
++	}
++}
++
++func (d *sessionDirs) len() int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.ll.Len()
++}
++
++// Resolve 返回会话的相对目录（yyyy-MM/dd/<session>）。
++func (d *sessionDirs) Resolve(session string, now time.Time) (string, error) {
++	if session == "" {
++		return dateDir(now) + "/" + NoSessionDir, nil
++	}
++	key := hashKey(session)
++	if dir, ok := d.cached(key); ok {
++		return dir, nil
++	}
++	marker := filepath.Join(d.root, ".sessions", key[:2], key)
++	if dir, err := readSessionMarker(marker); err == nil {
++		d.remember(key, dir)
++		return dir, nil
++	} else if !errors.Is(err, fs.ErrNotExist) {
++		return "", err
++	}
++
++	dir := dateDir(now) + "/" + safeName(session)
++	if err := os.MkdirAll(filepath.Dir(marker), 0o750); err != nil {
++		return "", err
++	}
++	tmp, err := os.CreateTemp(filepath.Dir(marker), ".tmp-*")
++	if err != nil {
++		return "", err
++	}
++	_, werr := fmt.Fprintf(tmp, "%s\n", dir)
++	cerr := tmp.Close()
++	if werr != nil || cerr != nil {
++		_ = os.Remove(tmp.Name())
++		return "", errors.Join(werr, cerr)
++	}
++	linkErr := os.Link(tmp.Name(), marker)
++	_ = os.Remove(tmp.Name())
++	if linkErr != nil {
++		if !errors.Is(linkErr, fs.ErrExist) {
++			return "", linkErr
++		}
++		// 并发竞争：另一请求已写入，以其为准。
++		existing, err := readSessionMarker(marker)
++		if err != nil {
++			return "", err
++		}
++		dir = existing
++	}
++	d.remember(key, dir)
++	return dir, nil
++}
++
++func readSessionMarker(path string) (string, error) {
++	b, err := os.ReadFile(path) //nolint:gosec // path 由 sha256 派生
++	if err != nil {
++		return "", err
++	}
++	dir := strings.TrimSpace(string(b))
++	if dir == "" || strings.Contains(dir, "..") {
++		return "", fmt.Errorf("audit: corrupt session marker %s", path)
++	}
++	return dir, nil
++}
+diff --git a/backend/internal/audit/store.go b/backend/internal/audit/store.go
+new file mode 100644
+index 000000000..304be7c7c
+--- /dev/null
++++ b/backend/internal/audit/store.go
+@@ -0,0 +1,306 @@
++package audit
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// Store 管理归档根目录、会话目录映射、请求索引与压缩器。
++type Store struct {
++	cfg      Config
++	root     string
++	red      *redactor
++	sessions *sessionDirs
++	codec    *codec
++	pending  sync.WaitGroup
++	flushSem chan struct{}
++	closed   atomic.Bool
++	now      func() time.Time
++
++	// 统计（用于性能报告与健康检查）
++	stats Stats
++}
++
++// Stats 是归档写入的累计计数。
++type Stats struct {
++	Requests      atomic.Int64
++	BeginErrors   atomic.Int64
++	CloseErrors   atomic.Int64
++	RawBytes      atomic.Int64
++	DroppedWrites atomic.Int64
++	FlushBacklog  atomic.Int64
++}
++
++// NewStore 创建归档存储；根目录不存在时自动创建。
++func NewStore(cfg Config) (*Store, error) {
++	if strings.TrimSpace(cfg.RootDir) == "" {
++		cfg.RootDir = DefaultConfig().RootDir
++	}
++	root, err := filepath.Abs(cfg.RootDir)
++	if err != nil {
++		return nil, err
++	}
++	if err := os.MkdirAll(root, 0o750); err != nil {
++		return nil, fmt.Errorf("audit: create root dir: %w", err)
++	}
++	c, err := newCodec(cfg.EncoderLevel)
++	if err != nil {
++		return nil, err
++	}
++	if cfg.MemoryBufferBytes <= 0 {
++		cfg.MemoryBufferBytes = DefaultConfig().MemoryBufferBytes
++	}
++	if len(cfg.SessionHeaders) == 0 {
++		cfg.SessionHeaders = DefaultSessionHeaders
++	}
++	if cfg.FlushWorkers <= 0 {
++		cfg.FlushWorkers = DefaultConfig().FlushWorkers
++	}
++	return &Store{
++		cfg:      cfg,
++		root:     root,
++		red:      newRedactor(cfg),
++		sessions: newSessionDirs(root, cfg.SessionCacheSize),
++		codec:    c,
++		flushSem: make(chan struct{}, cfg.FlushWorkers),
++		now:      time.Now,
++	}, nil
++}
++
++// Root 返回归档根目录的绝对路径。
++func (s *Store) Root() string { return s.root }
++
++// Config 返回生效配置。
++func (s *Store) Config() Config { return s.cfg }
++
++// StatsSnapshot 返回统计快照。
++func (s *Store) StatsSnapshot() map[string]int64 {
++	return map[string]int64{
++		"requests":       s.stats.Requests.Load(),
++		"begin_errors":   s.stats.BeginErrors.Load(),
++		"close_errors":   s.stats.CloseErrors.Load(),
++		"raw_bytes":      s.stats.RawBytes.Load(),
++		"dropped_writes": s.stats.DroppedWrites.Load(),
++		"flush_backlog":  s.stats.FlushBacklog.Load(),
++		"session_cache":  int64(s.sessions.len()),
++	}
++}
++
++// Close 停止接收新归档并等待已结束请求的压缩落盘完成。
++func (s *Store) Close(ctx context.Context) error {
++	if s == nil {
++		return nil
++	}
++	s.closed.Store(true)
++	done := make(chan struct{})
++	go func() {
++		s.pending.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++var refRE = regexp.MustCompile(`^\d{4}-\d{2}/\d{2}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}-\d{1,6}$`)
++
++// ValidRef 校验归档引用（相对根目录的基础路径，不含 kind 后缀）。
++func ValidRef(ref string) bool {
++	return refRE.MatchString(ref) && !strings.Contains(ref, "..")
++}
++
++// FilePath 返回某个归档引用下指定 kind 的文件绝对路径。
++func (s *Store) FilePath(ref, kind string) (string, error) {
++	if !ValidRef(ref) {
++		return "", fmt.Errorf("audit: invalid archive ref")
++	}
++	valid := false
++	for _, k := range Kinds {
++		valid = valid || k == kind
++	}
++	if !valid {
++		return "", fmt.Errorf("audit: invalid kind")
++	}
++	p := filepath.Join(s.root, filepath.FromSlash(ref)+"-"+kind+".zst")
++	if !strings.HasPrefix(p, s.root+string(filepath.Separator)) {
++		return "", fmt.Errorf("audit: invalid archive ref")
++	}
++	return p, nil
++}
++
++// Begin 为一个客户端请求创建归档器。
++//
++// 请求热路径上只解析会话目录（有界 LRU 命中为纯内存；未命中时读/建一次标记文件，
++// 保证“最先开始的请求”固定会话日期）；目录与四个文件的创建、索引追加全部推迟到后台
++// （请求结束后的落盘 goroutine，或大正文切换流式压缩时）。
++func (s *Store) Begin(requestID, session, sessionHeader string, now time.Time) (*Recorder, error) {
++	if s.closed.Load() {
++		return nil, errors.New("audit: store closed")
++	}
++	sessDir, err := s.sessions.Resolve(session, now)
++	if err != nil {
++		return nil, err
++	}
++	rec := &Recorder{
++		sessDir:       sessDir,
++		store:         s,
++		ID:            requestID,
++		Session:       session,
++		SessionHeader: sessionHeader,
++		Started:       now,
++		open:          make(map[*section]struct{}),
++	}
++	for i := range Kinds {
++		idx := i
++		rec.files[i] = newArchiveFile(func() (*os.File, error) {
++			files, err := rec.ensureFiles()
++			if err != nil {
++				return nil, err
++			}
++			return files[idx], nil
++		}, s.codec, s.cfg.MemoryBufferBytes)
++	}
++	s.pending.Add(1)
++	s.stats.Requests.Add(1)
++	return rec, nil
++}
++
++// ensureFiles 只执行一次：定位会话目录（固定首次日期），以 O_EXCL 创建四个文件
++// （{yyyy-MM}/{dd}/{session}/{requestId}-{n}-{kind}.zst，n 递增，重复请求 ID 不覆盖），
++// 并追加请求索引。
++func (r *Recorder) ensureFiles() ([4]*os.File, error) {
++	r.filesOnce.Do(func() {
++		r.filesRes, r.filesErr = r.store.createFiles(r)
++		if r.filesErr != nil {
++			r.store.stats.BeginErrors.Add(1)
++			slog.Warn("audit_archive_create_failed", "request_id", r.ID, "error", r.filesErr)
++		}
++	})
++	return r.filesRes, r.filesErr
++}
++
++func (s *Store) createFiles(r *Recorder) ([4]*os.File, error) {
++	var files [4]*os.File
++	sessDir := r.sessDir
++	absDir := filepath.Join(s.root, filepath.FromSlash(sessDir))
++	if err := os.MkdirAll(absDir, 0o750); err != nil {
++		return files, err
++	}
++	name := safeName(r.ID)
++	for n := 1; n <= 999999; n++ {
++		base := fmt.Sprintf("%s-%d", name, n)
++		f, err := os.OpenFile(filepath.Join(absDir, base+"-"+KindClientRequest+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
++		if errors.Is(err, fs.ErrExist) {
++			continue
++		}
++		if err != nil {
++			return files, err
++		}
++		files[0] = f
++		for i, kind := range Kinds[1:] {
++			f, err := os.OpenFile(filepath.Join(absDir, base+"-"+kind+".zst"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
++			if err != nil {
++				for _, opened := range files[:i+1] {
++					_ = opened.Close()
++				}
++				return [4]*os.File{}, err
++			}
++			files[i+1] = f
++		}
++		ref := sessDir + "/" + base
++		r.mu.Lock()
++		r.ref = ref
++		r.mu.Unlock()
++		s.appendIndex(r.ID, IndexEntry{Ref: ref, Time: r.Started, Via: "client_request_id", RequestID: r.ID, Session: r.Session})
++		return files, nil
++	}
++	return files, errors.New("audit: too many duplicate request ids")
++}
++
++// IndexEntry 是请求索引中的一行。索引按 ID 的 sha256 分桶，查找为 O(1) 文件读取。
++type IndexEntry struct {
++	Ref            string    `json:"ref"`
++	Time           time.Time `json:"t"`
++	Via            string    `json:"via"`
++	RequestID      string    `json:"request_id,omitempty"`
++	Session        string    `json:"session,omitempty"`
++	UsageRequestID string    `json:"usage_request_id,omitempty"`
++	UsageState     string    `json:"usage_state,omitempty"`
++	UsageError     string    `json:"usage_error,omitempty"`
++	APIKeyID       int64     `json:"api_key_id,omitempty"`
++	AccountID      int64     `json:"account_id,omitempty"`
++	UserID         int64     `json:"user_id,omitempty"`
++}
++
++func (s *Store) indexPath(key string) string {
++	h := hashKey(key)
++	return filepath.Join(s.root, ".index", h[:2], h[2:4], h+".idx")
++}
++
++func (s *Store) appendIndex(key string, e IndexEntry) {
++	key = strings.TrimSpace(key)
++	if key == "" {
++		return
++	}
++	p := s.indexPath(key)
++	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
++		slog.Warn("audit_index_mkdir_failed", "error", err)
++		return
++	}
++	line, err := json.Marshal(e)
++	if err != nil {
++		return
++	}
++	line = append(line, '\n')
++	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o640) //nolint:gosec // 路径由 sha256 派生
++	if err != nil {
++		slog.Warn("audit_index_open_failed", "error", err)
++		return
++	}
++	// 单次 write + O_APPEND：多写者并发追加时行不会交错。
++	if _, err := f.Write(line); err != nil {
++		slog.Warn("audit_index_write_failed", "error", err)
++	}
++	_ = f.Close()
++}
++
++// Lookup 返回某个 ID（客户端请求 ID 或用量 request_id）对应的全部索引行。
++func (s *Store) Lookup(key string) ([]IndexEntry, error) {
++	key = strings.TrimSpace(key)
++	if key == "" {
++		return nil, nil
++	}
++	f, err := os.Open(s.indexPath(key))
++	if errors.Is(err, fs.ErrNotExist) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = f.Close() }()
++	var out []IndexEntry
++	sc := bufio.NewScanner(f)
++	sc.Buffer(make([]byte, 0, 4096), 1<<20)
++	for sc.Scan() {
++		var e IndexEntry
++		if json.Unmarshal(sc.Bytes(), &e) == nil && ValidRef(e.Ref) {
++			out = append(out, e)
++		}
++	}
++	return out, sc.Err()
++}
+diff --git a/backend/internal/audit/trace.go b/backend/internal/audit/trace.go
+new file mode 100644
+index 000000000..105115229
+--- /dev/null
++++ b/backend/internal/audit/trace.go
+@@ -0,0 +1,41 @@
++package audit
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"net/http"
++
++	"go.opentelemetry.io/otel/propagation"
++	"go.opentelemetry.io/otel/trace"
++)
++
++// TraceInfo 是归档使用的 trace/span 关联信息。
++type TraceInfo struct {
++	TraceID      string `json:"trace_id"`
++	SpanID       string `json:"span_id"`
++	ParentSpanID string `json:"parent_span_id,omitempty"`
++	// Source: otel_context（进程内已有 span）/ traceparent（客户端 W3C 头）/ generated
++	Source string `json:"source"`
++}
++
++// traceFromRequest 优先复用 OTel 上下文中的 span，其次解析 W3C traceparent，
++// 均无时生成新的 trace id。只读取，不向上游注入任何头，因此不改变真实调用。
++func traceFromRequest(ctx context.Context, h http.Header) TraceInfo {
++	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
++		return TraceInfo{TraceID: sc.TraceID().String(), ParentSpanID: sc.SpanID().String(), SpanID: newSpanID(), Source: "otel_context"}
++	}
++	extracted := propagation.TraceContext{}.Extract(context.Background(), propagation.HeaderCarrier(h))
++	if sc := trace.SpanContextFromContext(extracted); sc.IsValid() {
++		return TraceInfo{TraceID: sc.TraceID().String(), ParentSpanID: sc.SpanID().String(), SpanID: newSpanID(), Source: "traceparent"}
++	}
++	var tid [16]byte
++	_, _ = rand.Read(tid[:])
++	return TraceInfo{TraceID: hex.EncodeToString(tid[:]), SpanID: newSpanID(), Source: "generated"}
++}
++
++func newSpanID() string {
++	var b [8]byte
++	_, _ = rand.Read(b[:])
++	return hex.EncodeToString(b[:])
++}
+diff --git a/backend/internal/audit/transport.go b/backend/internal/audit/transport.go
+new file mode 100644
+index 000000000..648447c90
+--- /dev/null
++++ b/backend/internal/audit/transport.go
+@@ -0,0 +1,297 @@
++package audit
++
++import (
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++)
++
++// AttemptInfo 是调用方已知的调度信息。
++type AttemptInfo struct {
++	AccountID int64
++	// Proxy 仅记录是否经代理及代理方案，不记录凭据。
++	Proxy string
++	// Via 标识接入点（http_upstream / http_upstream_tls / openai_ws_dial）。
++	Via string
++}
++
++// roundTripper 在真实传输之上旁路记录实际上游请求与上游响应：
++// 记录的是交给 Transport 的最终请求（协议转换、UA 改写、默认头、账户切换之后），
++// 以及 Transport 返回的原始响应字节（Content-Encoding 保持原样，展示时再解码）。
++type roundTripper struct {
++	base http.RoundTripper
++	info AttemptInfo
++}
++
++// WrapClient 返回浅拷贝的 client，其 Transport 增加归档旁路。
++// 没有归档器的请求（例如后台任务）原样透传。
++func WrapClient(client *http.Client, info AttemptInfo) *http.Client {
++	if client == nil || Default() == nil {
++		return client
++	}
++	clone := *client
++	base := clone.Transport
++	if base == nil {
++		base = http.DefaultTransport
++	}
++	if rt, ok := base.(*roundTripper); ok {
++		base = rt.base
++	}
++	clone.Transport = &roundTripper{base: base, info: info}
++	return &clone
++}
++
++// RedactProxy 只保留代理方案与主机，去掉用户名密码。
++func RedactProxy(proxy string) string {
++	proxy = strings.TrimSpace(proxy)
++	if proxy == "" {
++		return ""
++	}
++	if i := strings.Index(proxy, "@"); i >= 0 {
++		scheme := ""
++		if j := strings.Index(proxy, "://"); j >= 0 && j < i {
++			scheme = proxy[:j+3]
++		}
++		return scheme + "***@" + proxy[i+1:]
++	}
++	return proxy
++}
++
++func (t *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	rec := FromContext(req.Context())
++	if rec == nil || rec.Finished() {
++		return t.base.RoundTrip(req)
++	}
++	red := rec.store.red
++	seq := rec.NextAttempt()
++	spanID := newSpanID()
++	transport := "http"
++	if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
++		transport = "websocket"
++	}
++	meta := map[string]any{
++		"attempt":        seq,
++		"account_id":     t.info.AccountID,
++		"via":            t.info.Via,
++		"proxy":          RedactProxy(t.info.Proxy),
++		"trace_id":       rec.TraceID,
++		"span_id":        spanID,
++		"parent_span_id": rec.SpanID,
++		"content_length": req.ContentLength,
++	}
++	// Transport 隐式行为：未显式声明 Accept-Encoding 时，net/http 会自动加 gzip 并透明解压。
++	if req.Header.Get("Accept-Encoding") == "" && transport == "http" {
++		meta["transport_implicit_accept_encoding"] = "gzip (net/http default, transparently decoded)"
++	}
++	host := req.Host
++	if host == "" && req.URL != nil {
++		host = req.URL.Host
++	}
++	reqSec := rec.startSection(KindUpstreamRequest, SectionHeader{
++		Seq:       seq,
++		Method:    req.Method,
++		URL:       red.URL(req.URL),
++		Proto:     req.Proto,
++		Host:      host,
++		Header:    red.Header(req.Header),
++		Transport: transport,
++		Meta:      meta,
++	})
++
++	out := req
++	var tb *upstreamBody
++	if req.Body != nil && req.Body != http.NoBody {
++		out = req.Clone(req.Context())
++		tb = &upstreamBody{ReadCloser: req.Body, sec: reqSec}
++		out.Body = tb
++		if req.GetBody != nil {
++			orig := req.GetBody
++			var replayMu sync.Mutex
++			current := tb
++			out.GetBody = func() (io.ReadCloser, error) {
++				// Transport 重放请求体（连接复用失败 / 307 等）：前一段标记为未完成，开启新段。
++				body, err := orig()
++				if err != nil {
++					return body, err
++				}
++				replayMu.Lock()
++				defer replayMu.Unlock()
++				current.replaced()
++				sec := rec.startSection(KindUpstreamRequest, SectionHeader{Seq: seq, Replay: true, Method: req.Method, URL: red.URL(req.URL), Header: red.Header(req.Header), Transport: transport, Meta: map[string]any{"attempt": seq, "span_id": spanID}})
++				current = &upstreamBody{ReadCloser: body, sec: sec}
++				return current, nil
++			}
++		}
++	} else {
++		reqSec.end(true, "", nil)
++	}
++
++	resp, err := t.base.RoundTrip(out)
++	if err != nil {
++		rec.startSection(KindUpstreamResponse, SectionHeader{Seq: seq, Meta: map[string]any{"attempt": seq, "account_id": t.info.AccountID, "span_id": spanID}}).
++			end(false, "transport error: "+err.Error(), nil)
++		return resp, err
++	}
++
++	respMeta := map[string]any{
++		"attempt":    seq,
++		"account_id": t.info.AccountID,
++		"span_id":    spanID,
++	}
++	if resp.Uncompressed {
++		respMeta["transport_decoded"] = true
++	}
++	respTransport := "http"
++	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
++		respTransport = "sse"
++	}
++	if resp.StatusCode == http.StatusSwitchingProtocols {
++		respTransport = "websocket"
++	}
++	respSec := rec.startSection(KindUpstreamResponse, SectionHeader{
++		Seq:       seq,
++		Status:    resp.StatusCode,
++		Proto:     resp.Proto,
++		Header:    red.Header(resp.Header),
++		Transport: respTransport,
++		Meta:      respMeta,
++	})
++
++	if resp.StatusCode == http.StatusSwitchingProtocols {
++		// 升级后的连接由 WS 客户端以消息粒度记录（见 WSTap），这里不包装可写 Body。
++		respSec.end(true, "", map[string]any{"upgraded": true})
++		rec.mu.Lock()
++		rec.lastWS = int32(seq) //nolint:gosec // bounded
++		rec.mu.Unlock()
++		return resp, nil
++	}
++	if resp.Body == nil || resp.Body == http.NoBody {
++		respSec.end(true, "", nil)
++		return resp, nil
++	}
++	resp.Body = &responseBody{ReadCloser: resp.Body, sec: respSec}
++	return resp, nil
++}
++
++// upstreamBody 复制 Transport 实际读取并发送的请求体字节。
++type upstreamBody struct {
++	io.ReadCloser
++	sec  *section
++	mu   sync.Mutex
++	eof  bool
++	err  error
++	done bool
++}
++
++func (b *upstreamBody) Read(p []byte) (int, error) {
++	n, err := b.ReadCloser.Read(p)
++	if n > 0 {
++		b.sec.body(p[:n])
++	}
++	if err != nil {
++		b.mu.Lock()
++		if errors.Is(err, io.EOF) {
++			b.eof = true
++		} else if b.err == nil {
++			b.err = err
++		}
++		b.mu.Unlock()
++		if errors.Is(err, io.EOF) {
++			b.finish()
++		}
++	}
++	return n, err
++}
++
++func (b *upstreamBody) Close() error {
++	err := b.ReadCloser.Close()
++	b.finish()
++	return err
++}
++
++func (b *upstreamBody) finish() {
++	b.mu.Lock()
++	if b.done {
++		b.mu.Unlock()
++		return
++	}
++	b.done = true
++	eof, rerr := b.eof, b.err
++	b.mu.Unlock()
++	switch {
++	case eof:
++		b.sec.end(true, "", nil)
++	case rerr != nil:
++		b.sec.end(false, "read error: "+rerr.Error(), nil)
++	default:
++		b.sec.end(false, "request body closed before EOF", nil)
++	}
++}
++
++func (b *upstreamBody) replaced() {
++	b.mu.Lock()
++	if b.done {
++		b.mu.Unlock()
++		return
++	}
++	b.done = true
++	b.mu.Unlock()
++	b.sec.end(false, "request body replayed by transport", nil)
++}
++
++// responseBody 复制业务实际读取到的上游响应字节。
++type responseBody struct {
++	io.ReadCloser
++	sec  *section
++	mu   sync.Mutex
++	eof  bool
++	err  error
++	done bool
++}
++
++func (b *responseBody) Read(p []byte) (int, error) {
++	n, err := b.ReadCloser.Read(p)
++	if n > 0 {
++		b.sec.body(p[:n])
++	}
++	if err != nil {
++		b.mu.Lock()
++		if errors.Is(err, io.EOF) {
++			b.eof = true
++		} else if b.err == nil {
++			b.err = err
++		}
++		b.mu.Unlock()
++		if errors.Is(err, io.EOF) {
++			b.finish()
++		}
++	}
++	return n, err
++}
++
++func (b *responseBody) Close() error {
++	err := b.ReadCloser.Close()
++	b.finish()
++	return err
++}
++
++func (b *responseBody) finish() {
++	b.mu.Lock()
++	if b.done {
++		b.mu.Unlock()
++		return
++	}
++	b.done = true
++	eof, rerr := b.eof, b.err
++	b.mu.Unlock()
++	switch {
++	case eof:
++		b.sec.end(true, "", nil)
++	case rerr != nil:
++		b.sec.end(false, "read error: "+rerr.Error(), nil)
++	default:
++		b.sec.end(false, "response body closed before EOF (consumer stopped reading)", nil)
++	}
++}
+diff --git a/backend/internal/audit/usage.go b/backend/internal/audit/usage.go
+new file mode 100644
+index 000000000..4cb008733
+--- /dev/null
++++ b/backend/internal/audit/usage.go
+@@ -0,0 +1,91 @@
++package audit
++
++import (
++	"context"
++	"strings"
++	"time"
++)
++
++// 用量回调状态。注意：回调只说明“仓储层调用已返回”，不代表事务已提交；
++// 展示层以数据库中实际存在的 usage_logs 行为准。
++const (
++	UsageStateWriteReturned = "write_returned"        // 非事务写入返回成功（仍以数据库查询为准）
++	UsageStateDuplicate     = "duplicate_ignored"     // ON CONFLICT 未插入
++	UsageStatePendingTx     = "pending_tx_not_proven" // 处于外部事务内，提交与否未知
++	UsageStateFailed        = "write_failed"
++)
++
++// UsageEvent 是仓储层写用量后的回调参数。
++type UsageEvent struct {
++	RequestID string
++	APIKeyID  int64
++	AccountID int64
++	UserID    int64
++	Inserted  bool
++	InTx      bool
++	Err       error
++}
++
++// OnUsage 把用量 request_id 关联到当前请求的归档（追加索引 + 附注）。
++// context 中没有归档器（后台补记、异步任务）时直接忽略。
++func OnUsage(ctx context.Context, ev UsageEvent) {
++	rec := FromContext(ctx)
++	if rec == nil || strings.TrimSpace(ev.RequestID) == "" {
++		return
++	}
++	state := UsageStateWriteReturned
++	errText := ""
++	switch {
++	case ev.Err != nil:
++		state, errText = UsageStateFailed, ev.Err.Error()
++	case ev.InTx:
++		state = UsageStatePendingTx
++	case !ev.Inserted:
++		state = UsageStateDuplicate
++	}
++	entry := IndexEntry{
++		Time:           time.Now(),
++		Via:            "usage_callback",
++		RequestID:      rec.ID,
++		Session:        rec.Session,
++		UsageRequestID: ev.RequestID,
++		UsageState:     state,
++		UsageError:     errText,
++		APIKeyID:       ev.APIKeyID,
++		AccountID:      ev.AccountID,
++		UserID:         ev.UserID,
++	}
++	// 请求进行中：暂存到归档器，由落盘 goroutine 写索引（不在请求路径上做文件 I/O）；
++	// 请求已结束（异步计费回调）：后台补写。
++	rec.mu.Lock()
++	if !rec.finished.Load() {
++		rec.usage = append(rec.usage, entry)
++		rec.mu.Unlock()
++	} else {
++		rec.mu.Unlock()
++		rec.store.pending.Add(1)
++		go func() {
++			defer rec.store.pending.Done()
++			if _, err := rec.ensureFiles(); err == nil {
++				entry.Ref = rec.ArchiveRef()
++				rec.store.writeUsageIndex(entry)
++			}
++		}()
++	}
++	rec.Note(KindClientResponse, 0, map[string]any{
++		"type":             "usage_callback",
++		"usage_request_id": ev.RequestID,
++		"usage_state":      state,
++		"usage_error":      errText,
++		"api_key_id":       ev.APIKeyID,
++		"account_id":       ev.AccountID,
++	})
++}
++
++// writeUsageIndex 用量 request_id 与客户端请求 ID 不同（client:/local:/web_search: 等前缀）时单独建索引。
++func (s *Store) writeUsageIndex(e IndexEntry) {
++	if e.UsageRequestID != e.RequestID {
++		s.appendIndex(e.UsageRequestID, e)
++	}
++	s.appendIndex(e.RequestID, e)
++}
+diff --git a/backend/internal/audit/ws.go b/backend/internal/audit/ws.go
+new file mode 100644
+index 000000000..96d241b66
+--- /dev/null
++++ b/backend/internal/audit/ws.go
+@@ -0,0 +1,112 @@
++package audit
++
++import (
++	"context"
++	"sync"
++)
++
++// WSTap 以消息粒度记录上游 WebSocket 连接的收发（已解除 permessage-deflate）。
++//
++// 上游 WS 连接可能被连接池复用、由常驻读循环以后台 context 读取，因此：
++//   - 带归档器的 context 调用时，连接绑定到该请求（若与上次不同则切换并开启新段）；
++//   - 不带归档器的 context（读循环）沿用最近绑定的请求。
++//
++// 握手请求/响应头由 RoundTripper 在建连时记录；复用连接在新请求中以
++// ws_reused 段标注原建连请求。
++type WSTap struct {
++	mu      sync.Mutex
++	rec     *Recorder
++	seq     int
++	out     *section
++	in      *section
++	dialReq string
++	dialSeq int
++}
++
++// NewWSTap 在建连成功后创建 Tap；ctx 中无归档器时仍返回可用的 Tap（等待后续绑定）。
++func NewWSTap(ctx context.Context) *WSTap {
++	if Default() == nil {
++		return nil
++	}
++	t := &WSTap{}
++	if rec := FromContext(ctx); rec != nil {
++		rec.mu.Lock()
++		t.dialSeq = int(rec.lastWS)
++		rec.lastWS = 0
++		rec.mu.Unlock()
++		t.dialReq = rec.ID
++		t.bindLocked(rec, t.dialSeq, false)
++	}
++	return t
++}
++
++func (t *WSTap) bindLocked(rec *Recorder, seq int, reused bool) {
++	if t.rec != nil {
++		t.out.end(true, "", map[string]any{"ws_released": true})
++		t.in.end(true, "", map[string]any{"ws_released": true})
++	}
++	t.rec, t.out, t.in = rec, nil, nil
++	if rec == nil || rec.Finished() {
++		t.rec = nil
++		return
++	}
++	if seq <= 0 {
++		seq = rec.NextAttempt()
++	}
++	t.seq = seq
++	meta := map[string]any{"attempt": seq, "ws_messages": true}
++	if reused {
++		meta["ws_reused"] = true
++		meta["dial_request_id"] = t.dialReq
++	}
++	t.out = rec.startSection(KindUpstreamRequest, SectionHeader{Seq: seq, Transport: "websocket", Meta: meta})
++	t.in = rec.startSection(KindUpstreamResponse, SectionHeader{Seq: seq, Transport: "websocket", Meta: meta})
++}
++
++func (t *WSTap) target(ctx context.Context, outbound bool) *section {
++	if t == nil {
++		return nil
++	}
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if rec := FromContext(ctx); rec != nil && rec != t.rec && !rec.Finished() {
++		t.bindLocked(rec, 0, true)
++	}
++	if t.rec == nil || t.rec.Finished() {
++		return nil
++	}
++	if outbound {
++		return t.out
++	}
++	return t.in
++}
++
++// Sent 记录发往上游的一条消息。
++func (t *WSTap) Sent(ctx context.Context, op byte, data []byte) {
++	if s := t.target(ctx, true); s != nil {
++		s.message(op, data)
++	}
++}
++
++// Received 记录从上游收到的一条消息。
++func (t *WSTap) Received(ctx context.Context, op byte, data []byte) {
++	if s := t.target(ctx, false); s != nil {
++		s.message(op, data)
++	}
++}
++
++// Closed 记录连接关闭（错误原因写入两段的结束信息）。
++func (t *WSTap) Closed(reason string) {
++	if t == nil {
++		return
++	}
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.rec == nil {
++		return
++	}
++	complete := reason == ""
++	t.out.end(complete, reason, nil)
++	t.in.end(complete, reason, nil)
++	t.rec = nil
++}
+diff --git a/backend/internal/audit/wsraw.go b/backend/internal/audit/wsraw.go
+new file mode 100644
+index 000000000..f75577ac6
+--- /dev/null
++++ b/backend/internal/audit/wsraw.go
+@@ -0,0 +1,184 @@
++package audit
++
++import (
++	"bytes"
++	"compress/flate"
++	"encoding/binary"
++	"errors"
++	"io"
++	"strings"
++)
++
++// wsDeflate 描述协商得到的 permessage-deflate 参数（RFC 7692）。
++type wsDeflate struct {
++	enabled                 bool
++	serverNoContextTakeover bool
++	clientNoContextTakeover bool
++}
++
++func parseWSExtensions(v string) wsDeflate {
++	var d wsDeflate
++	for _, ext := range strings.Split(v, ",") {
++		params := strings.Split(ext, ";")
++		if strings.TrimSpace(params[0]) != "permessage-deflate" {
++			continue
++		}
++		d.enabled = true
++		for _, p := range params[1:] {
++			switch strings.TrimSpace(strings.SplitN(p, "=", 2)[0]) {
++			case "server_no_context_takeover":
++				d.serverNoContextTakeover = true
++			case "client_no_context_takeover":
++				d.clientNoContextTakeover = true
++			}
++		}
++	}
++	return d
++}
++
++// inflater 以“上一条消息末尾 32KB 明文”为预置字典解压每条消息，
++// 等价于 context takeover 下的滑动窗口，展示阶段离线即可还原。
++type inflater struct {
++	takeover bool
++	window   []byte
++}
++
++func (f *inflater) inflate(payload []byte) ([]byte, error) {
++	in := append(append([]byte(nil), payload...), 0x00, 0x00, 0xff, 0xff)
++	var dict []byte
++	if f.takeover {
++		dict = f.window
++	}
++	r := flate.NewReaderDict(bytes.NewReader(in), dict)
++	out, err := io.ReadAll(r)
++	_ = r.Close()
++	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
++		return out, err
++	}
++	if f.takeover {
++		f.window = append(f.window, out...)
++		if len(f.window) > 32<<10 {
++			f.window = append([]byte(nil), f.window[len(f.window)-(32<<10):]...)
++		}
++	}
++	return out, nil
++}
++
++// parseWSFrames 把劫持连接上的原始字节解析为消息（处理掩码、分片、压缩）。
++// dir 为展示方向标签；masked 表示客户端→服务端方向。
++func parseWSFrames(raw []byte, dir string, defl wsDeflate, clientToServer bool, limit int) ([]WSMessage, bool) {
++	var msgs []WSMessage
++	takeover := defl.enabled
++	if clientToServer && defl.clientNoContextTakeover {
++		takeover = false
++	}
++	if !clientToServer && defl.serverNoContextTakeover {
++		takeover = false
++	}
++	inf := &inflater{takeover: takeover}
++
++	var (
++		msgOp         byte
++		msgCompressed bool
++		msgBuf        []byte
++		inMessage     bool
++	)
++	pos := 0
++	for pos < len(raw) {
++		if len(msgs) >= limit {
++			return msgs, true
++		}
++		if len(raw)-pos < 2 {
++			return msgs, true
++		}
++		b0, b1 := raw[pos], raw[pos+1]
++		fin := b0&0x80 != 0
++		rsv1 := b0&0x40 != 0
++		op := b0 & 0x0f
++		masked := b1&0x80 != 0
++		plen := uint64(b1 & 0x7f)
++		hdr := 2
++		switch plen {
++		case 126:
++			if len(raw)-pos < 4 {
++				return msgs, true
++			}
++			plen = uint64(binary.BigEndian.Uint16(raw[pos+2:]))
++			hdr = 4
++		case 127:
++			if len(raw)-pos < 10 {
++				return msgs, true
++			}
++			plen = binary.BigEndian.Uint64(raw[pos+2:])
++			hdr = 10
++		}
++		var key []byte
++		if masked {
++			if len(raw)-pos < hdr+4 {
++				return msgs, true
++			}
++			key = raw[pos+hdr : pos+hdr+4]
++			hdr += 4
++		}
++		if plen > uint64(len(raw)-pos-hdr) {
++			// 帧不完整（连接中断或展示截断）。
++			return msgs, true
++		}
++		payload := append([]byte(nil), raw[pos+hdr:pos+hdr+int(plen)]...) //nolint:gosec // 已校验边界
++		if masked {
++			for i := range payload {
++				payload[i] ^= key[i%4]
++			}
++		}
++		pos += hdr + int(plen) //nolint:gosec // 已校验边界
++
++		if op >= 8 { // 控制帧：可插在分片之间
++			m := WSMessage{Dir: dir, Op: opName(op), Size: len(payload)}
++			if op == WSOpClose && len(payload) >= 2 {
++				m.Text = strings.TrimSpace(strings.Join([]string{itoa(int(binary.BigEndian.Uint16(payload))), string(payload[2:])}, " "))
++			} else {
++				setPayload(&m.Text, &m.Base64, payload, 4096)
++			}
++			msgs = append(msgs, m)
++			continue
++		}
++		if op != 0 {
++			msgOp, msgCompressed, msgBuf, inMessage = op, rsv1 && defl.enabled, payload, true
++		} else if inMessage {
++			msgBuf = append(msgBuf, payload...)
++		} else {
++			continue
++		}
++		if !fin {
++			continue
++		}
++		inMessage = false
++		m := WSMessage{Dir: dir, Op: opName(msgOp), Compressed: msgCompressed}
++		data := msgBuf
++		if msgCompressed {
++			out, err := inf.inflate(msgBuf)
++			if err != nil {
++				m.Error = "inflate: " + err.Error()
++			}
++			data = out
++		}
++		m.Size = len(data)
++		setPayload(&m.Text, &m.Base64, data, 256<<10)
++		msgs = append(msgs, m)
++	}
++	return msgs, false
++}
++
++func itoa(v int) string {
++	if v == 0 {
++		return "0"
++	}
++	var b [12]byte
++	i := len(b)
++	for v > 0 {
++		i--
++		b[i] = byte('0' + v%10)
++		v /= 10
++	}
++	return string(b[i:])
++}
+diff --git a/backend/internal/handler/admin/usage_audit_archive.go b/backend/internal/handler/admin/usage_audit_archive.go
+new file mode 100644
+index 000000000..ce23276f7
+--- /dev/null
++++ b/backend/internal/handler/admin/usage_audit_archive.go
+@@ -0,0 +1,36 @@
++package admin
++
++import (
++	"context"
++	"errors"
++
++	"github.com/Wei-Shaw/sub2api/internal/audit"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++)
++
++// AuditArchiveUsageLookup 为请求归档提供用量记录查询（以数据库中已提交的行为准）。
++func (h *UsageHandler) AuditArchiveUsageLookup() audit.UsageLookup {
++	return func(ctx context.Context, id int64) (*audit.UsageRef, error) {
++		if h == nil || h.usageService == nil {
++			return nil, errors.New("usage service unavailable")
++		}
++		log, err := h.usageService.GetByID(ctx, id)
++		if err != nil {
++			if errors.Is(err, service.ErrUsageLogNotFound) {
++				return nil, nil
++			}
++			return nil, err
++		}
++		if log == nil {
++			return nil, nil
++		}
++		return &audit.UsageRef{
++			ID:        log.ID,
++			RequestID: log.RequestID,
++			APIKeyID:  log.APIKeyID,
++			AccountID: log.AccountID,
++			UserID:    log.UserID,
++			CreatedAt: log.CreatedAt,
++		}, nil
++	}
++}
+diff --git a/backend/internal/repository/http_upstream.go b/backend/internal/repository/http_upstream.go
+index ff19b03d8..15ee572f1 100644
+--- a/backend/internal/repository/http_upstream.go
++++ b/backend/internal/repository/http_upstream.go
+@@ -26,6 +26,7 @@ import (
+ 	"golang.org/x/mod/semver"
+ 	"golang.org/x/net/http2"
+ 
++	"github.com/Wei-Shaw/sub2api/internal/audit"
+ 	"github.com/Wei-Shaw/sub2api/internal/config"
+ 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
+ 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyutil"
+@@ -218,6 +219,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
+ 
+ 	// 执行请求
+ 	client := s.httpClientForUpstreamRequest(entry.client, req)
++	client = audit.WrapClient(client, audit.AttemptInfo{AccountID: accountID, Proxy: proxyURL, Via: "http_upstream"})
+ 	client = httpClientWithGrokAccessDeniedFallback(client)
+ 	resp, err := doUpstreamRequest(client, req)
+ 	if err != nil {
+@@ -279,6 +281,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
+ 	}
+ 
+ 	client := s.httpClientForUpstreamRequest(entry.client, req)
++	client = audit.WrapClient(client, audit.AttemptInfo{AccountID: accountID, Proxy: proxyURL, Via: "http_upstream_tls"})
+ 	client = httpClientWithGrokAccessDeniedFallback(client)
+ 	resp, err := doUpstreamRequest(client, req)
+ 	if err != nil {
+diff --git a/backend/internal/repository/usage_log_audit_hook.go b/backend/internal/repository/usage_log_audit_hook.go
+new file mode 100644
+index 000000000..d6d6723b7
+--- /dev/null
++++ b/backend/internal/repository/usage_log_audit_hook.go
+@@ -0,0 +1,26 @@
++package repository
++
++import (
++	"context"
++
++	dbent "github.com/Wei-Shaw/sub2api/ent"
++	"github.com/Wei-Shaw/sub2api/internal/audit"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++)
++
++// auditUsageWritten 是请求归档的 OnUsage 钩子：把用量 request_id 关联到当前请求归档。
++// 处于外部事务中的写入只标记为“未证实提交”，展示层始终以数据库中的 usage_logs 为准。
++func auditUsageWritten(ctx context.Context, log *service.UsageLog, inserted bool, err error) {
++	if log == nil || audit.FromContext(ctx) == nil {
++		return
++	}
++	audit.OnUsage(ctx, audit.UsageEvent{
++		RequestID: log.RequestID,
++		APIKeyID:  log.APIKeyID,
++		AccountID: log.AccountID,
++		UserID:    log.UserID,
++		Inserted:  inserted,
++		InTx:      dbent.TxFromContext(ctx) != nil,
++		Err:       err,
++	})
++}
+diff --git a/backend/internal/repository/usage_log_repo_insert.go b/backend/internal/repository/usage_log_repo_insert.go
+index e004433f3..fe9914ee8 100644
+--- a/backend/internal/repository/usage_log_repo_insert.go
++++ b/backend/internal/repository/usage_log_repo_insert.go
+@@ -150,10 +150,11 @@ const (
+ 	usageLogCreateStateCanceled
+ )
+ 
+-func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) (bool, error) {
++func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) (inserted bool, err error) {
+ 	if log == nil {
+ 		return false, nil
+ 	}
++	defer func() { auditUsageWritten(ctx, log, inserted, err) }()
+ 
+ 	if tx := dbent.TxFromContext(ctx); tx != nil {
+ 		return r.createSingle(ctx, tx.Client(), log)
+@@ -166,10 +167,12 @@ func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog)
+ 	return r.createBatched(ctx, log)
+ }
+ 
+-func (r *usageLogRepository) CreateBestEffort(ctx context.Context, log *service.UsageLog) error {
++func (r *usageLogRepository) CreateBestEffort(ctx context.Context, log *service.UsageLog) (err error) {
+ 	if log == nil {
+ 		return nil
+ 	}
++	// best-effort 批量路径的 ON CONFLICT 结果不回传，按“写入已返回”记录。
++	defer func() { auditUsageWritten(ctx, log, true, err) }()
+ 
+ 	if tx := dbent.TxFromContext(ctx); tx != nil {
+ 		_, err := r.createSingle(ctx, tx.Client(), log)
+diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
+index 315fc20e4..9ad827b08 100644
+--- a/backend/internal/server/routes/admin.go
++++ b/backend/internal/server/routes/admin.go
+@@ -94,6 +94,9 @@ func RegisterAdminRoutes(
+ 		// 使用记录管理
+ 		registerUsageRoutes(admin, h)
+ 
++		// 请求报文归档（internal/audit）：/admin/audit-archive/*
++		registerAuditArchiveRoutes(admin, h)
++
+ 		// 用户属性管理
+ 		registerUserAttributeRoutes(admin, h)
+ 
+diff --git a/backend/internal/server/routes/audit_archive.go b/backend/internal/server/routes/audit_archive.go
+new file mode 100644
+index 000000000..278e7a5b8
+--- /dev/null
++++ b/backend/internal/server/routes/audit_archive.go
+@@ -0,0 +1,46 @@
++package routes
++
++import (
++	"github.com/Wei-Shaw/sub2api/internal/audit"
++	"github.com/Wei-Shaw/sub2api/internal/handler"
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++
++	"github.com/gin-gonic/gin"
++)
++
++// withAuditArchive 在 ClientRequestID 中间件外层接入请求报文归档（internal/audit）。
++// 归档关闭时 audit.WrapHandler 直接调用原中间件，不改变任何行为。
++func withAuditArchive(next gin.HandlerFunc) gin.HandlerFunc {
++	return audit.WrapHandler(next, auditArchiveIdentity)
++}
++
++// auditArchiveIdentity 在请求结束时提取 API Key / 用户 / 分组 / 账户等关联字段。
++func auditArchiveIdentity(c *gin.Context) map[string]any {
++	meta := map[string]any{}
++	if v, ok := c.Get(string(middleware.ContextKeyAPIKey)); ok {
++		if key, ok := v.(*service.APIKey); ok && key != nil {
++			meta["api_key_id"] = key.ID
++			meta["user_id"] = key.UserID
++			if key.GroupID != nil {
++				meta["group_id"] = *key.GroupID
++			}
++		}
++	}
++	if v, ok := c.Get("ops_account_id"); ok {
++		meta["account_id"] = v
++	}
++	if v, ok := c.Get("ops_model"); ok {
++		meta["model"] = v
++	}
++	return meta
++}
++
++// registerAuditArchiveRoutes 注册归档查看接口（已挂在管理员鉴权之后）。
++func registerAuditArchiveRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
++	var lookup audit.UsageLookup
++	if h != nil && h.Admin != nil && h.Admin.Usage != nil {
++		lookup = h.Admin.Usage.AuditArchiveUsageLookup()
++	}
++	audit.RegisterRoutes(admin, lookup)
++}
+diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
+index 3f09ebf40..3c96ecf80 100644
+--- a/backend/internal/server/routes/gateway.go
++++ b/backend/internal/server/routes/gateway.go
+@@ -32,7 +32,7 @@ func RegisterGatewayRoutes(
+ ) {
+ 	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize)
+ 	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize)
+-	clientRequestID := middleware.ClientRequestID()
++	clientRequestID := withAuditArchive(middleware.ClientRequestID())
+ 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
+ 	endpointNorm := handler.InboundEndpointMiddleware()
+ 	compositeTarget := compositeTargetPlatformMiddleware(compositeResolver)
+diff --git a/backend/internal/service/openai_ws_client.go b/backend/internal/service/openai_ws_client.go
+index 7444e41d0..33f6ed315 100644
+--- a/backend/internal/service/openai_ws_client.go
++++ b/backend/internal/service/openai_ws_client.go
+@@ -1,7 +1,9 @@
+ package service
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -12,6 +14,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/Wei-Shaw/sub2api/internal/audit"
+ 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
+ 	coderws "github.com/coder/websocket"
+ 	"github.com/coder/websocket/wsjson"
+@@ -139,6 +142,12 @@ func (d *coderOpenAIWSClientDialer) Dial(
+ 		}
+ 		opts.HTTPClient = proxyClient
+ 	}
++	// 请求归档：记录实际握手请求/响应头（不包装升级后的连接）。
++	if baseClient := opts.HTTPClient; baseClient != nil {
++		opts.HTTPClient = audit.WrapClient(baseClient, audit.AttemptInfo{Proxy: proxyURL, Via: "openai_ws_dial"})
++	} else {
++		opts.HTTPClient = audit.WrapClient(http.DefaultClient, audit.AttemptInfo{Via: "openai_ws_dial"})
++	}
+ 
+ 	conn, resp, err := coderws.Dial(ctx, targetURL, opts)
+ 	if err != nil {
+@@ -163,6 +172,7 @@ func (d *coderOpenAIWSClientDialer) Dial(
+ 		respHeaders = cloneHeader(resp.Header)
+ 	}
+ 	wrapped.conn = conn
++	wrapped.tap = audit.NewWSTap(ctx)
+ 	return wrapped, 0, respHeaders, nil
+ }
+ 
+@@ -291,6 +301,15 @@ func (d *coderOpenAIWSClientDialer) SnapshotTransportMetrics() OpenAIWSTransport
+ type coderOpenAIWSClientConn struct {
+ 	conn          *coderws.Conn
+ 	upstreamPings atomic.Int64
++	// tap 以消息粒度归档上游 WS 收发；归档关闭时为 nil。
++	tap *audit.WSTap
++}
++
++func auditWSOp(t coderws.MessageType) byte {
++	if t == coderws.MessageBinary {
++		return audit.WSOpBinary
++	}
++	return audit.WSOpText
+ }
+ 
+ func (c *coderOpenAIWSClientConn) UpstreamPingCount() int64 {
+@@ -309,7 +328,15 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+-	return wsjson.Write(ctx, c.conn, value)
++	err := wsjson.Write(ctx, c.conn, value)
++	if c.tap != nil && err == nil {
++		// 与 wsjson.Write 相同的编码方式（json.Encoder，含末尾换行），保证归档字节一致。
++		var buf bytes.Buffer
++		if json.NewEncoder(&buf).Encode(value) == nil {
++			c.tap.Sent(ctx, audit.WSOpText, buf.Bytes())
++		}
++	}
++	return err
+ }
+ 
+ func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
+@@ -324,6 +351,7 @@ func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, erro
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	c.tap.Received(ctx, auditWSOp(msgType), payload)
+ 	switch msgType {
+ 	case coderws.MessageText, coderws.MessageBinary:
+ 		return payload, nil
+@@ -343,6 +371,7 @@ func (c *coderOpenAIWSClientConn) ReadFrame(ctx context.Context) (coderws.Messag
+ 	if err != nil {
+ 		return coderws.MessageText, nil, err
+ 	}
++	c.tap.Received(ctx, auditWSOp(msgType), payload)
+ 	return msgType, payload, nil
+ }
+ 
+@@ -353,7 +382,11 @@ func (c *coderOpenAIWSClientConn) WriteFrame(ctx context.Context, msgType coderw
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+-	return c.conn.Write(ctx, msgType, payload)
++	err := c.conn.Write(ctx, msgType, payload)
++	if err == nil {
++		c.tap.Sent(ctx, auditWSOp(msgType), payload)
++	}
++	return err
+ }
+ 
+ func (c *coderOpenAIWSClientConn) Ping(ctx context.Context) error {
+@@ -386,6 +419,7 @@ func (c *coderOpenAIWSClientConn) Close() error {
+ 	// Close 为幂等，忽略重复关闭错误。
+ 	_ = c.conn.Close(coderws.StatusNormalClosure, "")
+ 	_ = c.conn.CloseNow()
++	c.tap.Closed("")
+ 	return nil
+ }
+ 
+@@ -394,5 +428,6 @@ func (c *coderOpenAIWSClientConn) CloseNow() error {
+ 		return nil
+ 	}
+ 	_ = c.conn.CloseNow()
++	c.tap.Closed("connection closed without close handshake")
+ 	return nil
+ }
+diff --git a/frontend-audit/.gitignore b/frontend-audit/.gitignore
+new file mode 100644
+index 000000000..3c3629e64
+--- /dev/null
++++ b/frontend-audit/.gitignore
+@@ -0,0 +1 @@
++node_modules
+diff --git a/frontend-audit/build.sh b/frontend-audit/build.sh
+new file mode 100755
+index 000000000..35239455d
+--- /dev/null
++++ b/frontend-audit/build.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++# 构建包含归档查看增强的前端产物（不修改 frontend/ 下任何源文件）。
++#
++#   frontend-audit/build.sh [额外 vite 参数...]
++#
++# 前置：已在 frontend/ 执行 pnpm install --frozen-lockfile。
++# 产物：与原始构建相同，输出到 backend/internal/web/dist（供 -tags embed 嵌入）。
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++repo="$(cd "$here/.." && pwd)"
++
++# 补丁目录自身不安装依赖：链接到 frontend/node_modules，使配置与组件解析到同一份依赖。
++ln -sfn "$repo/frontend/node_modules" "$here/node_modules"
++# 补丁自带依赖（CodeMirror）单独安装在 deps/，不修改 frontend/package.json。
++(cd "$repo/frontend" && pnpm install --dir "$here/deps" --frozen-lockfile --ignore-workspace)
++
++node "$here/tools/verify-patch.mjs"
++
++cd "$repo/frontend"
++pnpm run check:i18n
++pnpm exec vue-tsc -b
++pnpm exec vue-tsc --noEmit -p "$here/tsconfig.json"
++pnpm exec vitest run --config "$here/vitest.config.mts"
++pnpm exec vite build --config "$here/vite.config.mts" "$@"
++
++dist="${AUDIT_UI_DIST:-$repo/backend/internal/web/dist}"
++for arg in "$@"; do
++  case "$arg" in --outDir=*) dist="${arg#--outDir=}" ;; esac
++done
++grep -q 'name="sub2api-audit-ui"' "$dist/index.html" || { echo "audit-ui marker missing in $dist/index.html" >&2; exit 1; }
++echo "audit-ui build OK -> $dist"
+diff --git a/frontend-audit/deps/alias.mjs b/frontend-audit/deps/alias.mjs
+new file mode 100644
+index 000000000..4ca7ec32b
+--- /dev/null
++++ b/frontend-audit/deps/alias.mjs
+@@ -0,0 +1,14 @@
++// 补丁自带依赖（deps/node_modules）的解析别名；vue 等仍从 frontend/ 解析。
++import { resolve, dirname } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const modules = resolve(dirname(fileURLToPath(import.meta.url)), 'node_modules')
++
++/** 补丁自带依赖所在目录（用于单独分包） */
++export const auditDepsDir = modules
++
++/** @returns {{ find: RegExp, replacement: string }[]} */
++export function auditDepsAlias() {
++  // monaco-editor/<path> → 包内 esm/vs/<path>（与其 package.json exports 映射一致）
++  return [{ find: /^monaco-editor\/(.*)$/, replacement: `${modules}/monaco-editor/esm/vs/$1` }]
++}
+diff --git a/frontend-audit/deps/package.json b/frontend-audit/deps/package.json
+new file mode 100644
+index 000000000..01f4d95f1
+--- /dev/null
++++ b/frontend-audit/deps/package.json
+@@ -0,0 +1,8 @@
++{
++  "name": "sub2api-frontend-audit-deps",
++  "private": true,
++  "description": "归档查看补丁自带的依赖（不修改 frontend/package.json）",
++  "dependencies": {
++    "monaco-editor": "0.56.0"
++  }
++}
+diff --git a/frontend-audit/deps/pnpm-lock.yaml b/frontend-audit/deps/pnpm-lock.yaml
+new file mode 100644
+index 000000000..a5285bebf
+--- /dev/null
++++ b/frontend-audit/deps/pnpm-lock.yaml
+@@ -0,0 +1,45 @@
++lockfileVersion: '9.0'
++
++settings:
++  autoInstallPeers: true
++  excludeLinksFromLockfile: false
++
++importers:
++
++  .:
++    dependencies:
++      monaco-editor:
++        specifier: 0.56.0
++        version: 0.56.0
++
++packages:
++
++  '@types/trusted-types@2.0.7':
++    resolution: {integrity: sha512-ScaPdn1dQczgbl0QFTeTOmVHFULt394XJgOQNoyVhZ6r2vLnMLJfBPd53SB52T/3G36VI1/g2MZaX0cwDuXsfw==}
++
++  dompurify@3.4.8:
++    resolution: {integrity: sha512-yb1cEmaOum7wFvOCSQxyfgVlv5D47Rc30iZWoMpbDIWTnJ6grDDQyu2KFJzB2k7u0pMuJcQ1zphH//fFnw2tjQ==}
++
++  marked@14.0.0:
++    resolution: {integrity: sha512-uIj4+faQ+MgHgwUW1l2PsPglZLOLOT1uErt06dAPtx2kjteLAkbsd/0FiYg/MGS+i7ZKLb7w2WClxHkzOOuryQ==}
++    engines: {node: '>= 18'}
++    hasBin: true
++
++  monaco-editor@0.56.0:
++    resolution: {integrity: sha512-sXboRm3BeBeLm938eaiyLMe0OxzfXIlZvbv4ir/jVgQy1zDhWjgmny0WoN45fuDKhCCQsYMbBJrv/A6jd8aCUg==}
++
++snapshots:
++
++  '@types/trusted-types@2.0.7':
++    optional: true
++
++  dompurify@3.4.8:
++    optionalDependencies:
++      '@types/trusted-types': 2.0.7
++
++  marked@14.0.0: {}
++
++  monaco-editor@0.56.0:
++    dependencies:
++      dompurify: 3.4.8
++      marked: 14.0.0
+diff --git a/frontend-audit/plugin/usageTablePatch.mjs b/frontend-audit/plugin/usageTablePatch.mjs
+new file mode 100644
+index 000000000..fef53b07a
+--- /dev/null
++++ b/frontend-audit/plugin/usageTablePatch.mjs
+@@ -0,0 +1,59 @@
++/**
++ * 构建期补丁：在用量明细表（UsageTable.vue）的“时间”单元格中挂载归档查看入口。
++ *
++ * - 只在 Vite 构建管线中对源码做内存变换，磁盘上的原始 Vue/TS 文件保持不变；
++ * - “时间”列为 ALWAYS_VISIBLE 列，桌面表格与移动端卡片共用同一个具名插槽，
++ *   入口直接绑定行对象（row），分页 / 排序 / 跳转后不会串行；
++ * - 锚点缺失（基线变化）时直接让构建失败，而不是静默产出没有入口的产物。
++ */
++/** @typedef {import('vite').Plugin} Plugin */
++
++export const USAGE_TABLE_SUFFIX = '/src/components/admin/usage/UsageTable.vue'
++
++const SLOT_RE = /<template #cell-created_at="\{ value \}">([\s\S]*?)<\/template>/
++const SCRIPT_RE = /<script setup lang="ts">\n/
++
++/**
++ * @param {string} code
++ * @returns {string}
++ */
++export function patchUsageTable(code) {
++  if (!SLOT_RE.test(code)) {
++    throw new Error('[audit-ui] UsageTable.vue: anchor `#cell-created_at="{ value }"` not found; rebase frontend-audit patch onto the new baseline')
++  }
++  if (!SCRIPT_RE.test(code)) {
++    throw new Error('[audit-ui] UsageTable.vue: `<script setup lang="ts">` not found')
++  }
++  return code
++    .replace(
++      SLOT_RE,
++      (_m, inner) =>
++        `<template #cell-created_at="{ value, row }">${inner.replace(/\s+$/, '')}\n          <AuditArchiveEntry :row="row" />\n        </template>`
++    )
++    .replace(SCRIPT_RE, (m) => `${m}import AuditArchiveEntry from '@audit/AuditArchiveEntry.vue'\n`)
++}
++
++/** @returns {Plugin} */
++export function auditUsageTablePatch() {
++  let patched = false
++  return {
++    name: 'sub2api-audit-usage-table-patch',
++    enforce: 'pre',
++    transform(code, id) {
++      const file = id.split('?')[0].replace(/\\/g, '/')
++      if (!file.endsWith(USAGE_TABLE_SUFFIX) || id.includes('?vue&')) {
++        return null
++      }
++      patched = true
++      return { code: patchUsageTable(code), map: null }
++    },
++    transformIndexHtml(html) {
++      return html.replace('</head>', '  <meta name="sub2api-audit-ui" content="1" />\n</head>')
++    },
++    buildEnd(error) {
++      if (!error && !patched && this.meta.watchMode === false) {
++        this.error('[audit-ui] UsageTable.vue was never transformed; patch not applied')
++      }
++    }
++  }
++}
+diff --git a/frontend-audit/src/AuditArchiveEntry.vue b/frontend-audit/src/AuditArchiveEntry.vue
+new file mode 100644
+index 000000000..ed7001be7
+--- /dev/null
++++ b/frontend-audit/src/AuditArchiveEntry.vue
+@@ -0,0 +1,64 @@
++<template>
++  <span class="audit-entry">
++    <button
++      type="button"
++      class="audit-entry__btn"
++      :title="text.openTitle"
++      :data-usage-id="usageId"
++      data-testid="audit-archive-open"
++      :disabled="!usageId"
++      @click.stop="open = true"
++    >
++      {{ text.open }}
++    </button>
++    <AuditArchiveModal v-if="open && usageId" :key="usageId" :usage-id="usageId" @close="open = false" />
++  </span>
++</template>
++
++<script setup lang="ts">
++import { computed, ref, watch } from 'vue'
++import AuditArchiveModal from './AuditArchiveModal.vue'
++import { useAuditText } from './i18n'
++
++const props = defineProps<{ row: { id?: number } | null | undefined }>()
++const text = useAuditText()
++const open = ref(false)
++// 入口绑定行对象本身的 id：表格复用 DOM（分页/排序）时行变化会立即关闭弹窗，避免串日志。
++const usageId = computed(() => (typeof props.row?.id === 'number' ? props.row.id : 0))
++watch(usageId, () => {
++  open.value = false
++})
++</script>
++
++<style scoped>
++.audit-entry {
++  display: inline-flex;
++  margin-left: 0.5rem;
++  vertical-align: middle;
++}
++.audit-entry__btn {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  padding: 0 0.4rem;
++  font-size: 0.7rem;
++  line-height: 1.25rem;
++  color: rgb(37 99 235);
++  background: transparent;
++  cursor: pointer;
++  white-space: nowrap;
++}
++.audit-entry__btn:hover {
++  background: rgb(239 246 255);
++}
++.audit-entry__btn:disabled {
++  opacity: 0.4;
++  cursor: not-allowed;
++}
++:global(.dark) .audit-entry__btn {
++  border-color: rgb(75 85 99);
++  color: rgb(96 165 250);
++}
++:global(.dark) .audit-entry__btn:hover {
++  background: rgb(30 41 59);
++}
++</style>
+diff --git a/frontend-audit/src/AuditArchiveModal.vue b/frontend-audit/src/AuditArchiveModal.vue
+new file mode 100644
+index 000000000..7f23ca981
+--- /dev/null
++++ b/frontend-audit/src/AuditArchiveModal.vue
+@@ -0,0 +1,468 @@
++<template>
++  <Teleport to="body">
++    <div class="aa-overlay" data-testid="audit-archive-modal" @click.self="emit('close')">
++      <div class="aa-dialog" role="dialog" aria-modal="true" :aria-label="text.title">
++        <header class="aa-head">
++          <div class="aa-head__title">
++            <strong>{{ text.title }}</strong>
++            <span class="aa-muted">· {{ text.usageId }} #{{ usageId }}</span>
++          </div>
++          <button type="button" class="aa-btn" @click="emit('close')">{{ text.close }}</button>
++        </header>
++
++        <div class="aa-body">
++          <div v-if="loading" class="aa-state">{{ text.loading }}</div>
++
++          <div v-else-if="error" class="aa-state aa-state--error" data-testid="audit-archive-error">
++            <p>{{ error }}</p>
++            <button type="button" class="aa-btn" @click="load(currentRef)">{{ text.retry }}</button>
++          </div>
++
++          <template v-else-if="data">
++            <div v-if="data.resolution === 'not_found'" class="aa-state aa-state--warn" data-testid="audit-archive-not-found">
++              {{ text.notFound }}
++              <div class="aa-kv aa-kv--compact">
++                <span>{{ text.usageRequestId }}</span><code>{{ data.usage.request_id }}</code>
++              </div>
++            </div>
++
++            <div v-if="data.resolution === 'ambiguous' || data.resolution === 'best_match_with_alternatives'" class="aa-state aa-state--warn" data-testid="audit-archive-candidates">
++              <p>{{ data.resolution === 'ambiguous' ? text.ambiguous : text.alternatives }}</p>
++              <ul class="aa-cands">
++                <li v-for="c in data.candidates" :key="c.ref">
++                  <code>{{ c.ref }}</code>
++                  <span class="aa-muted">score {{ c.score }} · {{ c.match_reason.join(', ') || '-' }}</span>
++                  <span v-if="c.ref === data.ref" class="aa-badge aa-badge--ok">{{ text.current }}</span>
++                  <button v-else type="button" class="aa-btn aa-btn--sm" @click="load(c.ref)">{{ text.choose }}</button>
++                </li>
++              </ul>
++            </div>
++
++            <template v-if="data.archive">
++              <section class="aa-card">
++                <div class="aa-row">
++                  <span class="aa-badge" :class="statusClass(data.archive.status)" data-testid="audit-archive-status">{{ statusText(data.archive.status) }}</span>
++                  <code class="aa-muted aa-break">{{ data.archive.ref }}</code>
++                </div>
++                <details v-if="data.archive.issues?.length" class="aa-issues" open>
++                  <summary>{{ text.issues }} ({{ data.archive.issues.length }})</summary>
++                  <ul>
++                    <li v-for="(issue, i) in data.archive.issues" :key="i">{{ issue }}</li>
++                  </ul>
++                </details>
++              </section>
++
++              <section class="aa-card">
++                <h4>{{ text.summary }}</h4>
++                <div class="aa-kv">
++                  <span>{{ text.usageId }}</span><code>#{{ data.usage.id }}</code>
++                  <span>{{ text.usageRequestId }}</span><code class="aa-break">{{ data.usage.request_id }}</code>
++                  <span>{{ text.clientRequestId }}</span><code class="aa-break">{{ s.request_id ?? '-' }}</code>
++                  <span>{{ text.session }}</span><code class="aa-break">{{ s.session_id || 'nosession' }}<template v-if="s.session_header"> ({{ s.session_header }})</template></code>
++                  <span>{{ text.trace }}</span><code class="aa-break">{{ s.trace?.trace_id ?? '-' }} / {{ s.trace?.span_id ?? '-' }} <span class="aa-muted">{{ s.trace?.source }}</span></code>
++                  <span>{{ text.apiKey }}</span><code>{{ s.api_key_id ?? '-' }} <span class="aa-muted">(usage: {{ data.usage.api_key_id }})</span></code>
++                  <span>{{ text.user }}</span><code>{{ s.user_id ?? '-' }}</code>
++                  <span>{{ text.account }}</span><code>{{ s.account_id ?? '-' }} <span class="aa-muted">(usage: {{ data.usage.account_id }})</span></code>
++                  <span>{{ text.clientStatus }}</span><code>{{ s.client_status ?? s.status ?? '-' }}</code>
++                  <span>{{ text.duration }}</span><code>{{ s.duration_ms != null ? s.duration_ms + ' ms' : '-' }}</code>
++                </div>
++                <div v-if="usageNotes.length" class="aa-notes">
++                  <div class="aa-muted">{{ text.usageCallbacks }} — {{ text.usageCallbackHint }}</div>
++                  <div v-for="(n, i) in usageNotes" :key="i" class="aa-note">
++                    <code>{{ n.usage_request_id }}</code>
++                    <span class="aa-badge" :class="n.usage_state === 'write_failed' ? 'aa-badge--bad' : 'aa-badge--muted'">{{ n.usage_state }}</span>
++                    <span v-if="n.usage_error" class="aa-muted">{{ n.usage_error }}</span>
++                  </div>
++                </div>
++              </section>
++
++              <section v-if="data.archive.attempts.length" class="aa-card">
++                <h4>{{ text.attempts }} ({{ data.archive.attempts.length }})</h4>
++                <div class="aa-table-wrap">
++                  <table class="aa-table" data-testid="audit-archive-attempts">
++                    <thead>
++                      <tr><th>#</th><th>{{ text.account }}</th><th>Status</th><th>URL</th><th>Transport</th><th>Span</th><th></th></tr>
++                    </thead>
++                    <tbody>
++                      <tr v-for="a in data.archive.attempts" :key="a.seq">
++                        <td>{{ a.seq }}</td>
++                        <td>{{ a.account_id ?? '-' }}</td>
++                        <td><span class="aa-badge" :class="(a.status ?? 0) >= 400 || !a.status ? 'aa-badge--bad' : 'aa-badge--ok'">{{ a.status ?? '-' }}</span></td>
++                        <td class="aa-break">{{ a.method }} {{ a.url }}</td>
++                        <td>{{ a.transport }}<span v-if="a.ws_reused" class="aa-muted"> · {{ text.reused }}</span></td>
++                        <td><code>{{ a.span_id ?? '-' }}</code></td>
++                        <td>
++                          <span v-if="!a.complete" class="aa-badge aa-badge--warn" :title="a.error">{{ text.incompleteSection }}</span>
++                        </td>
++                      </tr>
++                    </tbody>
++                  </table>
++                </div>
++              </section>
++
++              <nav class="aa-tabs" role="tablist">
++                <button
++                  v-for="f in data.archive.files"
++                  :key="f.kind"
++                  type="button"
++                  role="tab"
++                  class="aa-tab"
++                  :class="{ 'aa-tab--active': activeKind === f.kind }"
++                  :data-testid="`audit-tab-${f.kind}`"
++                  @click="activeKind = f.kind"
++                >
++                  {{ text.files[f.kind] }}
++                  <span class="aa-muted">({{ f.sections.length }})</span>
++                  <span v-if="f.status !== 'ok'" class="aa-dot" :title="text.fileStatus[f.status]"></span>
++                </button>
++              </nav>
++
++              <section v-if="activeFile" class="aa-file" :data-testid="`audit-file-${activeFile.kind}`">
++                <div class="aa-row aa-muted">
++                  <span class="aa-badge" :class="activeFile.status === 'ok' ? 'aa-badge--ok' : 'aa-badge--bad'">{{ text.fileStatus[activeFile.status] }}</span>
++                  <span>zstd {{ formatBytes(activeFile.compressed_size) }} → {{ formatBytes(activeFile.raw_size) }}</span>
++                  <span v-if="activeFile.error">{{ activeFile.error }}</span>
++                </div>
++                <div v-if="!activeFile.sections.length" class="aa-state">{{ text.noSections }}</div>
++                <AuditSectionPanel
++                  v-for="sec in activeFile.sections"
++                  :key="`${activeFile.kind}-${sec.index}`"
++                  :section="sec"
++                  :kind="activeFile.kind"
++                  :archive-ref="data.archive.ref"
++                />
++              </section>
++            </template>
++          </template>
++        </div>
++      </div>
++    </div>
++  </Teleport>
++</template>
++
++<script setup lang="ts">
++import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
++import { useRoute } from 'vue-router'
++import AuditSectionPanel from './AuditSectionPanel.vue'
++import { fetchUsageArchive, type ApiError, type ArchiveKind, type UsageArchiveResponse } from './api'
++import { formatBytes, useAuditText } from './i18n'
++
++const props = defineProps<{ usageId: number }>()
++const emit = defineEmits<{ (e: 'close'): void }>()
++const text = useAuditText()
++const route = useRoute()
++
++const loading = ref(false)
++const error = ref('')
++const data = ref<UsageArchiveResponse | null>(null)
++const activeKind = ref<ArchiveKind>('client_request')
++const currentRef = ref<string | undefined>(undefined)
++let controller: AbortController | null = null
++let generation = 0
++
++const s = computed<Record<string, any>>(() => data.value?.archive?.summary ?? {})
++const usageNotes = computed<Record<string, any>[]>(() => (s.value.usage_notes as Record<string, any>[] | undefined) ?? [])
++const activeFile = computed(() => data.value?.archive?.files.find((f) => f.kind === activeKind.value))
++
++function statusText(st: string) {
++  return (
++    { complete: text.value.statusComplete, incomplete: text.value.statusIncomplete, in_progress: text.value.statusInProgress, missing: text.value.statusMissing } as Record<string, string>
++  )[st] ?? st
++}
++function statusClass(st: string) {
++  return st === 'complete' ? 'aa-badge--ok' : st === 'in_progress' ? 'aa-badge--warn' : 'aa-badge--bad'
++}
++
++function describeError(e: ApiError): string {
++  if (e.status === 401 || e.status === 403) return text.value.errForbidden
++  if (e.status === 503 || e.reason === 'AUDIT_ARCHIVE_DISABLED') return text.value.errDisabled
++  if (e.status === 404 || e.reason === 'USAGE_NOT_FOUND') return text.value.errUsageMissing
++  return `${text.value.errGeneric}: ${e.message ?? String(e)}`
++}
++
++async function load(ref?: string) {
++  controller?.abort()
++  controller = new AbortController()
++  const gen = ++generation
++  const requestedUsage = props.usageId
++  loading.value = true
++  error.value = ''
++  try {
++    const resp = await fetchUsageArchive(requestedUsage, ref, controller.signal)
++    // 只接受与当前弹窗、当前用量记录一致的最新响应，防止快速切换时串日志。
++    if (gen !== generation || resp.usage?.id !== props.usageId) return
++    data.value = resp
++    currentRef.value = resp.ref
++  } catch (e) {
++    if (gen !== generation) return
++    const err = e as ApiError & { code?: string }
++    if (err?.code === 'ERR_CANCELED') return
++    error.value = describeError(err)
++    data.value = null
++  } finally {
++    if (gen === generation) loading.value = false
++  }
++}
++
++function onKey(e: KeyboardEvent) {
++  if (e.key === 'Escape') emit('close')
++}
++
++onMounted(() => {
++  document.addEventListener('keydown', onKey)
++  load()
++})
++onBeforeUnmount(() => {
++  document.removeEventListener('keydown', onKey)
++  controller?.abort()
++})
++// 路由跳转（含分页参数变化）时关闭，避免弹窗内容与页面不一致。
++watch(() => route.fullPath, () => emit('close'))
++</script>
++
++<style scoped>
++.aa-overlay {
++  position: fixed;
++  inset: 0;
++  z-index: 1000;
++  background: rgb(15 23 42 / 0.55);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 1rem;
++  text-align: left;
++}
++.aa-dialog {
++  width: min(1100px, 100%);
++  max-height: calc(100vh - 2rem);
++  display: flex;
++  flex-direction: column;
++  border-radius: 0.75rem;
++  background: #fff;
++  color: rgb(17 24 39);
++  box-shadow: 0 20px 50px rgb(0 0 0 / 0.3);
++  font-size: 0.8125rem;
++}
++:global(.dark) .aa-dialog {
++  background: rgb(17 24 39);
++  color: rgb(229 231 235);
++}
++.aa-head {
++  flex-shrink: 0;
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 0.5rem;
++  padding: 0.75rem 1rem;
++  border-bottom: 1px solid rgb(229 231 235);
++}
++:global(.dark) .aa-head {
++  border-color: rgb(55 65 81);
++}
++.aa-head__title {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.aa-body {
++  overflow: auto;
++  padding: 0.75rem 1rem 1rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.75rem;
++}
++/* 纵向 flex 中的子块（尤其带 overflow 的标签栏）不允许被压缩，否则会塌成 1px。 */
++.aa-body > * {
++  flex-shrink: 0;
++}
++.aa-card {
++  border: 1px solid rgb(229 231 235);
++  border-radius: 0.5rem;
++  padding: 0.6rem 0.75rem;
++}
++:global(.dark) .aa-card {
++  border-color: rgb(55 65 81);
++}
++.aa-card h4 {
++  margin: 0 0 0.4rem;
++  font-weight: 600;
++}
++.aa-row {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 0.5rem;
++}
++.aa-kv {
++  display: grid;
++  grid-template-columns: max-content minmax(0, 1fr);
++  gap: 0.25rem 0.75rem;
++}
++.aa-kv > span {
++  color: rgb(107 114 128);
++}
++.aa-kv--compact {
++  margin-top: 0.5rem;
++}
++.aa-muted {
++  color: rgb(107 114 128);
++}
++.aa-break {
++  word-break: break-all;
++}
++.aa-state {
++  padding: 1rem;
++  border-radius: 0.5rem;
++  background: rgb(249 250 251);
++}
++:global(.dark) .aa-state {
++  background: rgb(31 41 55);
++}
++.aa-state--error {
++  background: rgb(254 242 242);
++  color: rgb(185 28 28);
++}
++.aa-state--warn {
++  background: rgb(255 251 235);
++  color: rgb(146 64 14);
++}
++:global(.dark) .aa-state--error,
++:global(.dark) .aa-state--warn {
++  background: rgb(55 48 30);
++}
++.aa-cands {
++  list-style: none;
++  padding: 0;
++  margin: 0.5rem 0 0;
++  display: flex;
++  flex-direction: column;
++  gap: 0.35rem;
++}
++.aa-cands li {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0.5rem;
++  align-items: center;
++  word-break: break-all;
++}
++.aa-btn {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  padding: 0.2rem 0.6rem;
++  background: transparent;
++  color: inherit;
++  cursor: pointer;
++}
++.aa-btn--sm {
++  padding: 0 0.45rem;
++  font-size: 0.75rem;
++}
++.aa-badge {
++  display: inline-block;
++  border-radius: 999px;
++  padding: 0 0.5rem;
++  font-size: 0.7rem;
++  line-height: 1.2rem;
++  white-space: nowrap;
++}
++.aa-badge--ok {
++  background: rgb(220 252 231);
++  color: rgb(21 128 61);
++}
++.aa-badge--bad {
++  background: rgb(254 226 226);
++  color: rgb(185 28 28);
++}
++.aa-badge--warn {
++  background: rgb(254 243 199);
++  color: rgb(146 64 14);
++}
++.aa-badge--muted {
++  background: rgb(243 244 246);
++  color: rgb(75 85 99);
++}
++.aa-issues ul {
++  margin: 0.25rem 0 0;
++  padding-left: 1.2rem;
++}
++.aa-notes {
++  margin-top: 0.5rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.25rem;
++}
++.aa-note {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0.4rem;
++  align-items: center;
++}
++.aa-table-wrap {
++  overflow-x: auto;
++}
++.aa-table {
++  width: 100%;
++  border-collapse: collapse;
++}
++.aa-table th,
++.aa-table td {
++  text-align: left;
++  padding: 0.3rem 0.4rem;
++  border-bottom: 1px solid rgb(243 244 246);
++  vertical-align: top;
++}
++:global(.dark) .aa-table th,
++:global(.dark) .aa-table td {
++  border-color: rgb(55 65 81);
++}
++.aa-tabs {
++  display: flex;
++  gap: 0.25rem;
++  overflow-x: auto;
++  border-bottom: 1px solid rgb(229 231 235);
++}
++.aa-tab {
++  border: none;
++  background: transparent;
++  color: inherit;
++  padding: 0.45rem 0.7rem;
++  cursor: pointer;
++  white-space: nowrap;
++  border-bottom: 2px solid transparent;
++  position: relative;
++}
++.aa-tab--active {
++  border-bottom-color: rgb(37 99 235);
++  font-weight: 600;
++}
++.aa-dot {
++  display: inline-block;
++  width: 0.45rem;
++  height: 0.45rem;
++  border-radius: 999px;
++  background: rgb(220 38 38);
++  margin-left: 0.25rem;
++}
++.aa-file {
++  display: flex;
++  flex-direction: column;
++  gap: 0.6rem;
++}
++@media (max-width: 640px) {
++  .aa-overlay {
++    padding: 0;
++  }
++  .aa-dialog {
++    max-height: 100vh;
++    height: 100vh;
++    border-radius: 0;
++  }
++  .aa-kv {
++    grid-template-columns: minmax(0, 1fr);
++  }
++  .aa-kv > span {
++    margin-top: 0.25rem;
++  }
++}
++</style>
+diff --git a/frontend-audit/src/AuditBodyView.vue b/frontend-audit/src/AuditBodyView.vue
+new file mode 100644
+index 000000000..d981bb3a8
+--- /dev/null
++++ b/frontend-audit/src/AuditBodyView.vue
+@@ -0,0 +1,216 @@
++<template>
++  <div class="ab" data-testid="audit-body">
++    <div class="ab-bar">
++      <span v-if="loading" class="ab-muted">{{ text.loading }}</span>
++      <span v-else-if="loadError" class="ab-note--bad">{{ loadError }}</span>
++      <span class="ab-spacer"></span>
++      <template v-if="json">
++        <button type="button" class="ab-btn" :disabled="!ready" data-testid="audit-body-unfold" @click="run('editor.unfoldAll')">{{ text.expandAll }}</button>
++        <button type="button" class="ab-btn" :disabled="!ready" data-testid="audit-body-fold" @click="run('editor.foldAll')">{{ text.collapseAll }}</button>
++      </template>
++      <button
++        type="button"
++        class="ab-btn"
++        :class="{ 'ab-btn--on': wrap }"
++        :aria-pressed="wrap"
++        data-testid="audit-body-wrap"
++        @click="wrap = !wrap"
++      >{{ text.wrapLines }}</button>
++      <button type="button" class="ab-btn" data-testid="audit-body-copy" @click="copyRaw">{{ text.copy }}</button>
++    </div>
++    <p v-if="copyMsg" class="ab-note" :class="copyOk ? 'ab-note--ok' : 'ab-note--bad'" data-testid="audit-body-copy-result">{{ copyMsg }}</p>
++    <!-- 原始文本直接交给 Monaco：JSON 排版、高亮、折叠、换行均由编辑器完成 -->
++    <div ref="host" class="ab-host" :style="{ height: `${height}px` }"></div>
++  </div>
++</template>
++
++<script setup lang="ts">
++import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
++import { useClipboard, useMutationObserver } from '@vueuse/core'
++import type * as Monaco from 'monaco-editor/editor/editor.api.js'
++import { useAuditText } from './i18n'
++
++const props = defineProps<{
++  text: string
++  /** 正文已按展示上限截断：复制时提示下载完整内容 */
++  truncated?: boolean
++}>()
++const text = useAuditText()
++
++const MAX_HEIGHT = 448
++const MIN_HEIGHT = 60
++
++// 只用于选择语言模式（不解析）：以 { / [ 开头按 JSON 展示
++const json = computed(() => /^\s*[[{]/.test(props.text))
++const wrap = ref(false)
++const height = ref(MIN_HEIGHT)
++const loading = ref(true)
++const loadError = ref('')
++const ready = ref(false)
++
++const host = ref<HTMLElement>()
++const editor = shallowRef<Monaco.editor.IStandaloneCodeEditor>()
++let monaco: typeof Monaco | undefined
++let disposed = false
++
++const isDark = () => document.documentElement.classList.contains('dark')
++useMutationObserver(document.documentElement, () => monaco?.editor.setTheme(isDark() ? 'vs-dark' : 'vs'), {
++  attributes: true,
++  attributeFilter: ['class']
++})
++
++/** 压缩成一行的 JSON 用 Monaco 自带格式化排版（按文本处理，数字原样保留）；JSON 语言服务在 worker 中就绪前重试。 */
++async function format(ed: Monaco.editor.IStandaloneCodeEditor) {
++  const model = ed.getModel()
++  if (!json.value || !model || model.getLineCount() > 1) return
++  for (let i = 0; i < 30 && !disposed && model.getLineCount() === 1; i++) {
++    ed.updateOptions({ readOnly: false })
++    await ed.getAction('editor.action.formatDocument')?.run()
++    ed.updateOptions({ readOnly: true })
++    if (model.getLineCount() === 1) await new Promise((r) => setTimeout(r, 100))
++  }
++}
++
++async function create() {
++  try {
++    monaco = (await import('./monaco')).monaco
++  } catch (e) {
++    loading.value = false
++    loadError.value = (e as Error)?.message ?? String(e)
++    return
++  }
++  if (disposed || !host.value) return
++  const ed = monaco.editor.create(host.value, {
++    value: props.text || text.value.empty,
++    language: json.value ? 'json' : 'plaintext',
++    theme: isDark() ? 'vs-dark' : 'vs',
++    readOnly: true,
++    domReadOnly: true,
++    wordWrap: wrap.value ? 'on' : 'off',
++    folding: true,
++    showFoldingControls: 'always',
++    minimap: { enabled: false },
++    scrollBeyondLastLine: false,
++    automaticLayout: true,
++    fontSize: 12,
++    lineNumbersMinChars: 3,
++    renderLineHighlight: 'none',
++    contextmenu: false,
++    stickyScroll: { enabled: false }
++  })
++  editor.value = ed
++  ed.onDidContentSizeChange(() => {
++    height.value = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, ed.getContentHeight()))
++  })
++  loading.value = false
++  await format(ed)
++  ready.value = true
++}
++
++function run(action: string) {
++  editor.value?.getAction(action)?.run()
++}
++
++onMounted(create)
++onBeforeUnmount(() => {
++  disposed = true
++  editor.value?.getModel()?.dispose()
++  editor.value?.dispose()
++})
++
++watch(
++  () => props.text,
++  async (t) => {
++    const ed = editor.value
++    const model = ed?.getModel()
++    if (!ed || !model || !monaco) return
++    model.setValue(t || text.value.empty)
++    monaco.editor.setModelLanguage(model, json.value ? 'json' : 'plaintext')
++    await format(ed)
++  }
++)
++watch(wrap, (on) => editor.value?.updateOptions({ wordWrap: on ? 'on' : 'off' }))
++
++// 复制原文（与归档一致，不受排版 / 折叠影响）。
++const { copy } = useClipboard({ legacy: true })
++const copyMsg = ref('')
++const copyOk = ref(true)
++let copyTimer: ReturnType<typeof setTimeout> | undefined
++async function copyRaw() {
++  try {
++    await copy(props.text)
++    copyOk.value = true
++    copyMsg.value = props.truncated ? text.value.copiedTruncated : text.value.copied
++  } catch {
++    copyOk.value = false
++    copyMsg.value = text.value.copyFailed
++  }
++  clearTimeout(copyTimer)
++  copyTimer = setTimeout(() => (copyMsg.value = ''), 3000)
++}
++</script>
++
++<style scoped>
++.ab {
++  display: flex;
++  flex-direction: column;
++  gap: 0.3rem;
++  min-width: 0;
++}
++.ab-bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 0.4rem;
++}
++.ab-spacer {
++  flex: 1;
++}
++.ab-muted {
++  color: rgb(107 114 128);
++  font-size: 0.75rem;
++}
++.ab-btn {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  padding: 0 0.5rem;
++  font-size: 0.75rem;
++  line-height: 1.4rem;
++  background: transparent;
++  color: inherit;
++  cursor: pointer;
++}
++.ab-btn:disabled {
++  opacity: 0.5;
++}
++.ab-btn--on {
++  background: rgb(219 234 254);
++  border-color: rgb(147 197 253);
++  color: rgb(29 78 216);
++}
++:global(.dark) .ab-btn--on {
++  background: rgb(30 58 138);
++  border-color: rgb(59 130 246);
++  color: rgb(219 234 254);
++}
++.ab-note {
++  margin: 0;
++  font-size: 0.75rem;
++}
++.ab-note--ok {
++  color: rgb(21 128 61);
++}
++.ab-note--bad {
++  color: rgb(185 28 28);
++}
++.ab-host {
++  min-width: 0;
++  width: 100%;
++  border: 1px solid rgb(229 231 235);
++  border-radius: 0.375rem;
++  overflow: hidden;
++}
++:global(.dark) .ab-host {
++  border-color: rgb(55 65 81);
++}
++</style>
+diff --git a/frontend-audit/src/AuditSectionPanel.vue b/frontend-audit/src/AuditSectionPanel.vue
+new file mode 100644
+index 000000000..58204a4df
+--- /dev/null
++++ b/frontend-audit/src/AuditSectionPanel.vue
+@@ -0,0 +1,311 @@
++<template>
++  <article class="as-card" :data-testid="`audit-section-${kind}-${section.index}`">
++    <div class="as-head">
++      <span v-if="isUpstream" class="as-badge as-badge--muted">{{ text.attempt }} #{{ section.seq }}</span>
++      <strong v-if="h.method" class="as-break">{{ h.method }} {{ h.url }}</strong>
++      <span v-if="h.status" class="as-badge" :class="h.status >= 400 ? 'as-badge--bad' : 'as-badge--ok'">{{ h.status }}</span>
++      <span v-if="h.transport" class="as-badge as-badge--muted">{{ h.transport }}</span>
++      <span v-if="h.proto" class="as-muted">{{ h.proto }}</span>
++      <span v-if="h.replay" class="as-badge as-badge--warn">{{ text.replay }}</span>
++      <span v-if="meta.account_id" class="as-muted">{{ text.account }} {{ meta.account_id }}</span>
++      <span v-if="meta.ws_reused" class="as-badge as-badge--warn">{{ text.reused }}</span>
++      <span class="as-muted">{{ fmtTime(h.time) }}</span>
++    </div>
++    <div class="as-head as-muted">
++      <span>{{ section.body_bytes }} {{ text.bytes }}</span>
++      <span v-if="section.hash_match === true" class="as-badge as-badge--ok" :title="section.body_sha256">{{ text.hashOk }}</span>
++      <span v-else-if="section.hash_match === false" class="as-badge as-badge--bad">{{ text.hashBad }}</span>
++      <span v-if="!section.end || !section.end.complete" class="as-badge as-badge--warn">
++        {{ text.incompleteSection }}<template v-if="section.end?.error">: {{ section.end.error }}</template>
++      </span>
++      <code class="as-break" :title="'sha256'">{{ section.body_sha256.slice(0, 16) }}…</code>
++    </div>
++
++    <details v-if="headerRows.length" class="as-details">
++      <summary>{{ text.headers }} ({{ headerRows.length }})</summary>
++      <div class="as-table-wrap">
++        <table class="as-table">
++          <tbody>
++            <tr v-for="([k, v], i) in headerRows" :key="i">
++              <th>{{ k }}</th>
++              <td class="as-break">{{ v }}</td>
++            </tr>
++          </tbody>
++        </table>
++      </div>
++    </details>
++    <details v-if="metaRows.length" class="as-details">
++      <summary>meta ({{ metaRows.length }})</summary>
++      <pre class="as-pre">{{ JSON.stringify(meta, null, 2) }}</pre>
++    </details>
++
++    <div v-if="body" class="as-body">
++      <div class="as-head">
++        <strong>{{ text.body }}</strong>
++        <span v-if="body.content_encoding" class="as-muted">
++          {{ text.encoding }}: {{ body.content_encoding }}<template v-if="body.decoded"> · {{ text.decodedForView }}</template>
++        </span>
++        <span v-if="body.decode_error" class="as-badge as-badge--warn">{{ body.decode_error }}</span>
++        <span class="as-spacer"></span>
++        <button type="button" class="as-btn" :disabled="downloading" data-testid="audit-download-raw" @click="download(false)">{{ text.downloadRaw }}</button>
++        <button v-if="body.content_encoding" type="button" class="as-btn" :disabled="downloading" @click="download(true)">{{ text.downloadDecoded }}</button>
++      </div>
++      <p v-if="downloadMsg" class="as-note" :class="downloadOk ? 'as-note--ok' : 'as-note--bad'" data-testid="audit-download-result">{{ downloadMsg }}</p>
++      <p v-if="body.truncated_for_display" class="as-note as-note--warn">{{ text.truncatedForUI }}</p>
++
++      <template v-if="body.sse?.length">
++        <div class="as-muted">
++          {{ text.sseEvents }}: {{ body.sse.length }} ·
++          <span :class="body.sse_terminated ? 'as-ok' : 'as-warn'">{{ body.sse_terminated ? text.sseTerminated : text.sseNotTerminated }}</span>
++          <button type="button" class="as-btn as-btn--link" @click="showRawSSE = !showRawSSE">{{ showRawSSE ? text.sseEvents : text.rawText }}</button>
++        </div>
++        <AuditBodyView v-if="showRawSSE" :text="body.text || ''" :truncated="body.truncated_for_display" />
++        <ol v-else class="as-events">
++          <li v-for="(ev, i) in visibleEvents" :key="i">
++            <span class="as-badge as-badge--muted">{{ ev.event || 'message' }}</span>
++            <code class="as-break">{{ ev.data }}</code>
++          </li>
++          <li v-if="body.sse.length > visibleEvents.length">
++            <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ body.sse.length - visibleEvents.length }}</button>
++          </li>
++        </ol>
++      </template>
++      <AuditBodyView v-else-if="body.is_text" :text="body.text || ''" :truncated="body.truncated_for_display" />
++      <template v-else>
++        <div class="as-muted">{{ text.binary }}</div>
++        <AuditBodyView :text="body.base64 || ''" :truncated="body.truncated_for_display" />
++      </template>
++    </div>
++
++    <div v-if="section.messages?.length" class="as-body">
++      <div class="as-head">
++        <strong>{{ text.wsMessages }} ({{ section.messages.length }}<template v-if="section.messages_truncated">+</template>)</strong>
++      </div>
++      <ol class="as-events">
++        <li v-for="(m, i) in visibleMessages" :key="i">
++          <span class="as-badge as-badge--muted">{{ m.dir }}</span>
++          <span class="as-badge" :class="m.op === 'close' ? 'as-badge--warn' : 'as-badge--muted'">{{ m.op }}</span>
++          <span class="as-muted">{{ m.size }}B<template v-if="m.compressed"> · deflate</template></span>
++          <span v-if="m.error" class="as-badge as-badge--bad">{{ m.error }}</span>
++          <code class="as-break">{{ m.text ?? m.base64 }}</code>
++        </li>
++        <li v-if="section.messages.length > visibleMessages.length">
++          <button type="button" class="as-btn as-btn--link" @click="eventLimit += 500">+{{ section.messages.length - visibleMessages.length }}</button>
++        </li>
++      </ol>
++    </div>
++  </article>
++</template>
++
++<script setup lang="ts">
++import { computed, ref } from 'vue'
++import { downloadBody, saveBlob, type ArchiveKind, type SectionView } from './api'
++import AuditBodyView from './AuditBodyView.vue'
++import { useAuditText } from './i18n'
++
++const props = defineProps<{ section: SectionView; kind: ArchiveKind; archiveRef: string }>()
++const text = useAuditText()
++
++const h = computed(() => props.section.header)
++const meta = computed<Record<string, any>>(() => ({ ...(h.value.meta ?? {}), ...(props.section.end?.meta ?? {}) }))
++const body = computed(() => props.section.body)
++const isUpstream = computed(() => props.kind === 'upstream_request' || props.kind === 'upstream_response')
++const headerRows = computed<[string, string][]>(() =>
++  Object.entries(h.value.header ?? {})
++    .sort(([a], [b]) => a.localeCompare(b))
++    .flatMap(([k, vs]) => vs.map((v) => [k, v] as [string, string]))
++)
++const metaRows = computed(() => Object.keys(meta.value))
++const showRawSSE = ref(false)
++const eventLimit = ref(500)
++const visibleEvents = computed(() => body.value?.sse?.slice(0, eventLimit.value) ?? [])
++const visibleMessages = computed(() => props.section.messages?.slice(0, eventLimit.value) ?? [])
++
++const downloading = ref(false)
++const downloadMsg = ref('')
++const downloadOk = ref(true)
++
++async function download(decode: boolean) {
++  downloading.value = true
++  downloadMsg.value = ''
++  try {
++    const res = await downloadBody(props.archiveRef, props.kind, props.section.index, decode)
++    saveBlob(res.blob, res.filename)
++    if (!decode && res.expectedSha256 && res.actualSha256) {
++      downloadOk.value = res.expectedSha256 === res.actualSha256
++      downloadMsg.value = downloadOk.value ? `${text.value.downloadVerified} (${res.actualSha256.slice(0, 16)}…)` : text.value.downloadMismatch
++    } else {
++      downloadOk.value = true
++      downloadMsg.value = `${text.value.downloadDone} (${res.blob.size} ${text.value.bytes})`
++    }
++  } catch (e) {
++    downloadOk.value = false
++    downloadMsg.value = (e as { message?: string })?.message ?? String(e)
++  } finally {
++    downloading.value = false
++  }
++}
++
++function fmtTime(t?: string) {
++  if (!t) return ''
++  const d = new Date(t)
++  return Number.isNaN(d.getTime()) ? t : d.toLocaleString()
++}
++</script>
++
++<style scoped>
++.as-card {
++  border: 1px solid rgb(229 231 235);
++  border-radius: 0.5rem;
++  padding: 0.6rem 0.75rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.4rem;
++  min-width: 0;
++}
++:global(.dark) .as-card {
++  border-color: rgb(55 65 81);
++}
++.as-head {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 0.4rem;
++}
++.as-spacer {
++  flex: 1;
++}
++.as-muted {
++  color: rgb(107 114 128);
++}
++.as-ok {
++  color: rgb(21 128 61);
++}
++.as-warn {
++  color: rgb(180 83 9);
++}
++.as-break {
++  word-break: break-all;
++}
++.as-badge {
++  display: inline-block;
++  border-radius: 999px;
++  padding: 0 0.5rem;
++  font-size: 0.7rem;
++  line-height: 1.2rem;
++  white-space: nowrap;
++}
++.as-badge--ok {
++  background: rgb(220 252 231);
++  color: rgb(21 128 61);
++}
++.as-badge--bad {
++  background: rgb(254 226 226);
++  color: rgb(185 28 28);
++}
++.as-badge--warn {
++  background: rgb(254 243 199);
++  color: rgb(146 64 14);
++}
++.as-badge--muted {
++  background: rgb(243 244 246);
++  color: rgb(75 85 99);
++}
++:global(.dark) .as-badge--muted {
++  background: rgb(55 65 81);
++  color: rgb(209 213 219);
++}
++.as-details summary {
++  cursor: pointer;
++  color: rgb(55 65 81);
++}
++:global(.dark) .as-details summary {
++  color: rgb(209 213 219);
++}
++.as-table-wrap {
++  overflow-x: auto;
++}
++.as-table {
++  border-collapse: collapse;
++  width: 100%;
++}
++.as-table th {
++  text-align: left;
++  font-weight: 500;
++  white-space: nowrap;
++  padding: 0.15rem 0.6rem 0.15rem 0;
++  color: rgb(107 114 128);
++  vertical-align: top;
++}
++.as-table td {
++  padding: 0.15rem 0;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++}
++.as-pre {
++  margin: 0;
++  max-height: 28rem;
++  overflow: auto;
++  padding: 0.5rem;
++  border-radius: 0.375rem;
++  background: rgb(249 250 251);
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 0.75rem;
++  white-space: pre-wrap;
++  word-break: break-all;
++}
++:global(.dark) .as-pre {
++  background: rgb(31 41 55);
++}
++.as-body {
++  display: flex;
++  flex-direction: column;
++  gap: 0.35rem;
++}
++.as-btn {
++  border: 1px solid rgb(209 213 219);
++  border-radius: 0.375rem;
++  padding: 0 0.5rem;
++  font-size: 0.75rem;
++  line-height: 1.4rem;
++  background: transparent;
++  color: inherit;
++  cursor: pointer;
++}
++.as-btn--link {
++  border: none;
++  color: rgb(37 99 235);
++}
++.as-btn:disabled {
++  opacity: 0.5;
++}
++.as-note {
++  margin: 0;
++  font-size: 0.75rem;
++}
++.as-note--ok {
++  color: rgb(21 128 61);
++}
++.as-note--bad {
++  color: rgb(185 28 28);
++}
++.as-note--warn {
++  color: rgb(146 64 14);
++}
++.as-events {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  max-height: 28rem;
++  overflow: auto;
++  display: flex;
++  flex-direction: column;
++  gap: 0.2rem;
++  font-size: 0.75rem;
++}
++.as-events li {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0.35rem;
++  align-items: baseline;
++}
++</style>
+diff --git a/frontend-audit/src/api.ts b/frontend-audit/src/api.ts
+new file mode 100644
+index 000000000..eb0507cf8
+--- /dev/null
++++ b/frontend-audit/src/api.ts
+@@ -0,0 +1,208 @@
++import { apiClient } from '@/api/client'
++
++export type ArchiveKind = 'client_request' | 'upstream_request' | 'upstream_response' | 'client_response'
++
++export interface SectionHeader {
++  kind: ArchiveKind
++  seq: number
++  time: string
++  method?: string
++  url?: string
++  proto?: string
++  host?: string
++  remote_addr?: string
++  status?: number
++  header?: Record<string, string[]>
++  transport?: string
++  replay?: boolean
++  meta?: Record<string, unknown>
++}
++
++export interface SectionEnd {
++  time: string
++  bytes: number
++  xxh64: string
++  complete: boolean
++  error?: string
++  meta?: Record<string, unknown>
++  raw_in?: number
++  messages?: number
++}
++
++export interface SSEEvent {
++  event?: string
++  id?: string
++  data: string
++}
++
++export interface BodyView {
++  content_encoding?: string
++  decoded: boolean
++  decode_error?: string
++  is_text: boolean
++  text?: string
++  base64?: string
++  truncated_for_display: boolean
++  sse?: SSEEvent[]
++  sse_terminated?: boolean
++}
++
++export interface WSMessage {
++  dir: string
++  op: string
++  time?: string
++  size: number
++  compressed?: boolean
++  text?: string
++  base64?: string
++  error?: string
++}
++
++export interface SectionView {
++  index: number
++  seq: number
++  header: SectionHeader
++  end?: SectionEnd
++  complete: boolean
++  body_bytes: number
++  body_sha256: string
++  hash_match?: boolean
++  body?: BodyView
++  messages?: WSMessage[]
++  messages_truncated?: boolean
++  raw_bytes?: number
++}
++
++export interface FileView {
++  kind: ArchiveKind
++  exists: boolean
++  compressed_size: number
++  raw_size: number
++  status: 'ok' | 'missing' | 'empty' | 'truncated' | 'corrupt' | 'error'
++  error?: string
++  sections: SectionView[]
++  notes?: Record<string, unknown>[]
++}
++
++export interface AttemptView {
++  seq: number
++  account_id?: number
++  method?: string
++  url?: string
++  transport?: string
++  status?: number
++  span_id?: string
++  error?: string
++  complete: boolean
++  ws_reused?: boolean
++  request_sections: number[]
++  response_sections: number[]
++}
++
++export interface ArchiveView {
++  ref: string
++  files: FileView[]
++  summary: Record<string, any>
++  attempts: AttemptView[]
++  status: 'complete' | 'incomplete' | 'in_progress' | 'missing'
++  issues?: string[]
++}
++
++export interface IndexEntry {
++  ref: string
++  t: string
++  via: string
++  request_id?: string
++  session?: string
++  usage_request_id?: string
++  usage_state?: string
++  usage_error?: string
++  api_key_id?: number
++  account_id?: number
++}
++
++export interface Candidate {
++  ref: string
++  entries: IndexEntry[]
++  score: number
++  match_reason: string[]
++}
++
++export interface UsageRef {
++  id: number
++  request_id: string
++  api_key_id: number
++  account_id: number
++  user_id: number
++  created_at: string
++}
++
++export type Resolution = 'unique' | 'chosen' | 'not_found' | 'ambiguous' | 'best_match_with_alternatives'
++
++export interface UsageArchiveResponse {
++  usage: UsageRef
++  candidates: Candidate[]
++  resolution: Resolution
++  ref?: string
++  archive?: ArchiveView
++}
++
++export interface ApiError {
++  status?: number
++  code?: string | number
++  message?: string
++  reason?: string
++}
++
++const BASE = '/admin/audit-archive'
++
++export async function fetchUsageArchive(usageId: number, ref: string | undefined, signal: AbortSignal): Promise<UsageArchiveResponse> {
++  const { data } = await apiClient.get<UsageArchiveResponse>(`${BASE}/usage/${usageId}`, {
++    params: ref ? { ref } : undefined,
++    signal,
++    timeout: 120000
++  })
++  return data
++}
++
++export interface DownloadResult {
++  blob: Blob
++  filename: string
++  expectedSha256?: string
++  actualSha256?: string
++}
++
++async function sha256Hex(blob: Blob): Promise<string | undefined> {
++  if (!globalThis.crypto?.subtle) return undefined
++  const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
++  return Array.from(new Uint8Array(digest))
++    .map((b) => b.toString(16).padStart(2, '0'))
++    .join('')
++}
++
++/** 下载某段正文；raw 下载在浏览器端复核 SHA-256 与归档记录一致。 */
++export async function downloadBody(ref: string, kind: ArchiveKind, index: number, decode: boolean): Promise<DownloadResult> {
++  const resp = await apiClient.get<Blob>(`${BASE}/body`, {
++    params: { ref, kind, index, decode: decode ? 1 : 0 },
++    responseType: 'blob',
++    timeout: 0
++  })
++  const blob = resp.data
++  const disposition = String(resp.headers['content-disposition'] || '')
++  const match = /filename="?([^";]+)"?/.exec(disposition)
++  const filename = match?.[1] || `${ref.split('/').pop()}-${kind}-${index}${decode ? '-decoded' : ''}.bin`
++  const expectedSha256 = (resp.headers['x-archive-body-sha256'] as string | undefined) || undefined
++  const actualSha256 = !decode ? await sha256Hex(blob) : undefined
++  return { blob, filename: decode ? filename.replace(/\.bin$/, '-decoded.bin') : filename, expectedSha256, actualSha256 }
++}
++
++export function saveBlob(blob: Blob, filename: string) {
++  const url = URL.createObjectURL(blob)
++  const a = document.createElement('a')
++  a.href = url
++  a.download = filename
++  document.body.appendChild(a)
++  a.click()
++  a.remove()
++  setTimeout(() => URL.revokeObjectURL(url), 1000)
++}
+diff --git a/frontend-audit/src/i18n.ts b/frontend-audit/src/i18n.ts
+new file mode 100644
+index 000000000..e75758451
+--- /dev/null
++++ b/frontend-audit/src/i18n.ts
+@@ -0,0 +1,192 @@
++import { computed } from 'vue'
++import { useI18n } from 'vue-i18n'
++
++const zh = {
++  open: '报文',
++  openTitle: '查看请求报文归档',
++  title: '请求报文归档',
++  close: '关闭',
++  loading: '正在读取归档…',
++  retry: '重试',
++  errForbidden: '无权限查看归档（需要管理员权限，或登录已过期）。',
++  errDisabled: '服务端未启用请求归档（audit.enabled=false）。',
++  errUsageMissing: '用量记录不存在（可能已被清理）。',
++  errGeneric: '读取归档失败',
++  notFound: '未找到该用量记录对应的归档。可能产生于启用归档之前、归档文件已被清理，或请求未经过网关采集。',
++  ambiguous: '找到多个候选归档且无法唯一确定，请选择：',
++  alternatives: '已按关联证据选择最佳匹配，另有候选：',
++  choose: '查看',
++  current: '当前',
++  statusComplete: '完整',
++  statusIncomplete: '不完整',
++  statusInProgress: '进行中 / 未落盘',
++  statusMissing: '缺失',
++  issues: '完整性问题',
++  summary: '链路关联',
++  usageId: '用量记录',
++  usageRequestId: '用量 request_id',
++  clientRequestId: '客户端请求 ID',
++  archiveRef: '归档位置',
++  session: '会话',
++  trace: 'Trace / Span',
++  apiKey: 'API Key',
++  user: '用户',
++  account: '账户',
++  clientStatus: '客户端状态码',
++  duration: '耗时',
++  usageCallbacks: '用量回调',
++  usageCallbackHint: '回调仅表示仓储写入已返回，不代表事务已提交；以数据库中的用量记录为准。',
++  attempts: '调度尝试',
++  attempt: '尝试',
++  reused: '复用连接',
++  files: {
++    client_request: '客户端请求',
++    upstream_request: '实际上游请求',
++    upstream_response: '上游响应',
++    client_response: '客户端响应'
++  } as Record<string, string>,
++  fileStatus: {
++    ok: '正常',
++    missing: '文件缺失',
++    empty: '未落盘（进行中或进程退出）',
++    truncated: '文件截断',
++    corrupt: '文件损坏',
++    error: '读取错误'
++  } as Record<string, string>,
++  noSections: '无内容',
++  headers: '请求头 / 响应头',
++  body: '正文',
++  bytes: '字节',
++  hashOk: '哈希一致',
++  hashBad: '哈希不一致',
++  incompleteSection: '未正常结束',
++  truncatedForUI: '正文超过展示上限，仅展示前部分；完整内容请下载。',
++  downloadRaw: '下载原始',
++  downloadDecoded: '下载解码',
++  downloadVerified: '下载完成，SHA-256 与归档一致',
++  downloadMismatch: '下载完成，但 SHA-256 与归档记录不一致',
++  downloadDone: '下载完成',
++  sseEvents: 'SSE 事件',
++  sseTerminated: '正常终止',
++  sseNotTerminated: '未见终止事件',
++  wsMessages: 'WebSocket 消息',
++  rawText: '原文',
++  pretty: '格式化',
++  binary: '二进制内容（Base64）',
++  encoding: '内容编码',
++  decodedForView: '已为展示解码',
++  replay: '传输层重放',
++  empty: '（空）',
++  copy: '复制',
++  copied: '已复制到剪贴板',
++  copiedTruncated: '已复制（展示内容已截断，完整内容请下载）',
++  copyFailed: '复制失败，请手动选择文本复制',
++  wrapLines: '自动换行',
++  expandAll: '全部展开',
++  collapseAll: '全部折叠'
++}
++
++type Dict = typeof zh
++
++const en: Dict = {
++  ...zh,
++  open: 'Payload',
++  openTitle: 'View archived request payloads',
++  title: 'Request archive',
++  close: 'Close',
++  loading: 'Loading archive…',
++  retry: 'Retry',
++  errForbidden: 'Not allowed to view archives (admin required, or session expired).',
++  errDisabled: 'Request archive is disabled on the server (audit.enabled=false).',
++  errUsageMissing: 'Usage record not found (it may have been cleaned up).',
++  errGeneric: 'Failed to load archive',
++  notFound: 'No archive found for this usage record. It may predate archiving, the files may have been cleaned up, or the request bypassed the gateway capture.',
++  ambiguous: 'Several candidate archives match and none can be chosen uniquely. Pick one:',
++  alternatives: 'Best match selected by correlation evidence; other candidates:',
++  choose: 'View',
++  current: 'Current',
++  statusComplete: 'Complete',
++  statusIncomplete: 'Incomplete',
++  statusInProgress: 'In progress / not flushed',
++  statusMissing: 'Missing',
++  issues: 'Integrity issues',
++  summary: 'Correlation',
++  usageId: 'Usage record',
++  usageRequestId: 'Usage request_id',
++  clientRequestId: 'Client request ID',
++  archiveRef: 'Archive path',
++  session: 'Session',
++  trace: 'Trace / Span',
++  apiKey: 'API key',
++  user: 'User',
++  account: 'Account',
++  clientStatus: 'Client status',
++  duration: 'Duration',
++  usageCallbacks: 'Usage callbacks',
++  usageCallbackHint: 'A callback only means the repository write returned; it does not prove the transaction committed. The usage record in the database is authoritative.',
++  attempts: 'Upstream attempts',
++  attempt: 'Attempt',
++  reused: 'reused conn',
++  files: {
++    client_request: 'Client request',
++    upstream_request: 'Upstream request',
++    upstream_response: 'Upstream response',
++    client_response: 'Client response'
++  },
++  fileStatus: {
++    ok: 'OK',
++    missing: 'File missing',
++    empty: 'Not flushed (in progress or process exited)',
++    truncated: 'File truncated',
++    corrupt: 'File corrupt',
++    error: 'Read error'
++  },
++  noSections: 'No content',
++  headers: 'Headers',
++  body: 'Body',
++  bytes: 'bytes',
++  hashOk: 'hash OK',
++  hashBad: 'hash mismatch',
++  incompleteSection: 'not completed',
++  truncatedForUI: 'Body exceeds the display limit; only the beginning is shown. Download for the full content.',
++  downloadRaw: 'Download raw',
++  downloadDecoded: 'Download decoded',
++  downloadVerified: 'Downloaded; SHA-256 matches the archive',
++  downloadMismatch: 'Downloaded, but SHA-256 differs from the archive record',
++  downloadDone: 'Downloaded',
++  sseEvents: 'SSE events',
++  sseTerminated: 'terminated normally',
++  sseNotTerminated: 'no terminal event seen',
++  wsMessages: 'WebSocket messages',
++  rawText: 'Raw',
++  pretty: 'Pretty',
++  binary: 'Binary content (Base64)',
++  encoding: 'Content-Encoding',
++  decodedForView: 'decoded for display',
++  replay: 'transport replay',
++  empty: '(empty)',
++  copy: 'Copy',
++  copied: 'Copied to clipboard',
++  copiedTruncated: 'Copied (display is truncated; download for the full content)',
++  copyFailed: 'Copy failed; select the text and copy manually',
++  wrapLines: 'Wrap lines',
++  expandAll: 'Expand all',
++  collapseAll: 'Collapse all'
++}
++
++export function useAuditText() {
++  const { locale } = useI18n({ useScope: 'global' })
++  return computed<Dict>(() => (String(locale.value).startsWith('zh') ? zh : en))
++}
++
++export function formatBytes(n: number | undefined): string {
++  if (!n) return '0 B'
++  const units = ['B', 'KB', 'MB', 'GB']
++  let v = n
++  let i = 0
++  while (v >= 1024 && i < units.length - 1) {
++    v /= 1024
++    i++
++  }
++  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
++}
+diff --git a/frontend-audit/src/monaco.ts b/frontend-audit/src/monaco.ts
+new file mode 100644
+index 000000000..996e974ed
+--- /dev/null
++++ b/frontend-audit/src/monaco.ts
+@@ -0,0 +1,16 @@
++// Monaco Editor（VS Code 编辑器内核）按需加载入口：只引入 JSON 展示用到的功能。
++import * as monaco from 'monaco-editor/editor/editor.api.js'
++import 'monaco-editor/language/json/monaco.contribution.js'
++import 'monaco-editor/editor/contrib/folding/browser/folding.js'
++import 'monaco-editor/editor/contrib/format/browser/formatActions.js'
++import 'monaco-editor/editor/contrib/find/browser/findController.js'
++import 'monaco-editor/editor/contrib/clipboard/browser/clipboard.js'
++import 'monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js'
++import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker'
++import JsonWorker from 'monaco-editor/language/json/json.worker.js?worker'
++
++;(self as unknown as { MonacoEnvironment: monaco.Environment }).MonacoEnvironment = {
++  getWorker: (_id, label) => (label === 'json' ? new JsonWorker() : new EditorWorker())
++}
++
++export { monaco }
+diff --git a/frontend-audit/tools/verify-patch.mjs b/frontend-audit/tools/verify-patch.mjs
+new file mode 100644
+index 000000000..9e4308cff
+--- /dev/null
++++ b/frontend-audit/tools/verify-patch.mjs
+@@ -0,0 +1,24 @@
++// 校验补丁锚点仍能在当前基线的 UsageTable.vue 上应用（不写回任何文件）。
++import { readFileSync } from 'node:fs'
++import { dirname, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { patchUsageTable } from '../plugin/usageTablePatch.mjs'
++
++const here = dirname(fileURLToPath(import.meta.url))
++const target = resolve(here, '../../frontend/src/components/admin/usage/UsageTable.vue')
++const source = readFileSync(target, 'utf8')
++const patched = patchUsageTable(source)
++
++const checks = [
++  [patched.includes('<template #cell-created_at="{ value, row }">'), 'slot exposes row'],
++  [patched.includes('<AuditArchiveEntry :row="row" />'), 'entry mounted in created_at cell'],
++  [patched.includes("import AuditArchiveEntry from '@audit/AuditArchiveEntry.vue'"), 'component imported'],
++  [patched.split('AuditArchiveEntry :row').length === 2, 'entry mounted exactly once'],
++  [readFileSync(target, 'utf8') === source, 'source file untouched'],
++]
++let failed = false
++for (const [ok, name] of checks) {
++  console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}`)
++  failed ||= !ok
++}
++if (failed) process.exit(1)
+diff --git a/frontend-audit/tsconfig.json b/frontend-audit/tsconfig.json
+new file mode 100644
+index 000000000..51f753a55
+--- /dev/null
++++ b/frontend-audit/tsconfig.json
+@@ -0,0 +1,14 @@
++{
++  "extends": "../frontend/tsconfig.json",
++  "compilerOptions": {
++    "baseUrl": ".",
++    "paths": {
++      "@/*": ["../frontend/src/*"],
++      "@audit/*": ["./src/*"],
++      "monaco-editor/*": ["./deps/node_modules/monaco-editor/esm/vs/*"]
++    },
++    "types": ["vite/client"]
++  },
++  "include": ["src/**/*.ts", "src/**/*.vue", "../frontend/src/**/*.d.ts"],
++  "exclude": []
++}
+diff --git a/frontend-audit/vite.config.mts b/frontend-audit/vite.config.mts
+new file mode 100644
+index 000000000..d051c9c0b
+--- /dev/null
++++ b/frontend-audit/vite.config.mts
+@@ -0,0 +1,37 @@
++/**
++ * 前端增强构建入口：复用原始 frontend/vite.config.ts，追加归档查看补丁。
++ *
++ * 用法（在 frontend/ 目录执行）：
++ *   pnpm exec vite build --config ../frontend-audit/vite.config.mts
++ *
++ * 原始 Vue/TS 源文件不做任何修改；不使用该配置时构建产物与上游完全一致。
++ */
++import { defineConfig, mergeConfig, type ConfigEnv, type UserConfig } from 'vite'
++import type { ManualChunksFunction } from 'rollup'
++import { resolve } from 'path'
++import baseConfig from '../frontend/vite.config'
++import { auditUsageTablePatch } from './plugin/usageTablePatch.mjs'
++import { auditDepsAlias, auditDepsDir } from './deps/alias.mjs'
++
++export default defineConfig(async (env: ConfigEnv) => {
++  const base = (typeof baseConfig === 'function' ? await baseConfig(env) : baseConfig) as UserConfig
++  // 原配置把 node_modules 统一并入首页预加载的 vendor 包；补丁自带依赖（Monaco）单独成包，
++  // 只在打开归档正文时按需加载，首页体积不变。
++  const output = base.build?.rollupOptions?.output
++  const baseChunks = !Array.isArray(output) && typeof output?.manualChunks === 'function' ? output.manualChunks : undefined
++  const manualChunks: ManualChunksFunction = (id, meta) => {
++    if (id.startsWith(auditDepsDir)) return 'audit-monaco'
++    // Vite 的按需加载辅助函数 Monaco 也会用到：固定单独成包，避免被并进 Monaco 包后连带进首页
++    if (id.includes('vite/preload-helper')) return 'vite-preload'
++    return baseChunks?.(id, meta)
++  }
++  return mergeConfig(base, {
++    build: { rollupOptions: { output: { manualChunks } } },
++    plugins: [auditUsageTablePatch()],
++    resolve: {
++      alias: [{ find: '@audit', replacement: resolve(__dirname, 'src') }, ...auditDepsAlias()],
++      // 补丁目录不带 node_modules：依赖统一从 frontend/ 解析，避免出现第二份 vue。
++      dedupe: ['vue', 'vue-router', 'vue-i18n', 'axios']
++    }
++  } satisfies UserConfig)
++})

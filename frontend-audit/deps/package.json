@@ -1,0 +1,8 @@
+{
+  "name": "sub2api-frontend-audit-deps",
+  "private": true,
+  "description": "归档查看补丁自带的依赖（不修改 frontend/package.json）",
+  "dependencies": {
+    "monaco-editor": "0.56.0"
+  }
+}

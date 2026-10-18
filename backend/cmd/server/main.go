@@ -16,6 +16,7 @@ import (
 	"time"
 
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
+	"github.com/Wei-Shaw/sub2api/internal/audit"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -152,6 +153,8 @@ func runMainServer() {
 	if err != nil {
 		log.Fatalf("Failed to initialize application: %v", err)
 	}
+	// 请求报文归档（internal/audit）：在时区初始化之后、开始接收请求之前初始化，默认目录 ./data/audit。
+	audit.Init()
 	defer app.Cleanup()
 	if app.PluginManager != nil {
 		if err := app.PluginManager.Start(context.Background()); err != nil {
@@ -190,6 +193,12 @@ func runMainServer() {
 	if err := app.Server.Shutdown(ctx); err != nil {
 		log.Printf("Server forced to shutdown: %v", err)
 	}
+	// 等待请求报文归档完成压缩落盘（internal/audit）。
+	auditCtx, auditCancel := context.WithTimeout(context.Background(), audit.ConfigFromViper().FinalizeTimeout)
+	if err := audit.Shutdown(auditCtx); err != nil {
+		log.Printf("Request archive flush incomplete: %v", err)
+	}
+	auditCancel()
 
 	log.Println("Server exited")
 }

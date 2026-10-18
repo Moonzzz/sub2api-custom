@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/audit"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -139,6 +142,12 @@ func (d *coderOpenAIWSClientDialer) Dial(
 		}
 		opts.HTTPClient = proxyClient
 	}
+	// 请求归档：记录实际握手请求/响应头（不包装升级后的连接）。
+	if baseClient := opts.HTTPClient; baseClient != nil {
+		opts.HTTPClient = audit.WrapClient(baseClient, audit.AttemptInfo{Proxy: proxyURL, Via: "openai_ws_dial"})
+	} else {
+		opts.HTTPClient = audit.WrapClient(http.DefaultClient, audit.AttemptInfo{Via: "openai_ws_dial"})
+	}
 
 	conn, resp, err := coderws.Dial(ctx, targetURL, opts)
 	if err != nil {
@@ -163,6 +172,7 @@ func (d *coderOpenAIWSClientDialer) Dial(
 		respHeaders = cloneHeader(resp.Header)
 	}
 	wrapped.conn = conn
+	wrapped.tap = audit.NewWSTap(ctx)
 	return wrapped, 0, respHeaders, nil
 }
 
@@ -291,6 +301,15 @@ func (d *coderOpenAIWSClientDialer) SnapshotTransportMetrics() OpenAIWSTransport
 type coderOpenAIWSClientConn struct {
 	conn          *coderws.Conn
 	upstreamPings atomic.Int64
+	// tap 以消息粒度归档上游 WS 收发；归档关闭时为 nil。
+	tap *audit.WSTap
+}
+
+func auditWSOp(t coderws.MessageType) byte {
+	if t == coderws.MessageBinary {
+		return audit.WSOpBinary
+	}
+	return audit.WSOpText
 }
 
 func (c *coderOpenAIWSClientConn) UpstreamPingCount() int64 {
@@ -309,7 +328,15 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return wsjson.Write(ctx, c.conn, value)
+	err := wsjson.Write(ctx, c.conn, value)
+	if c.tap != nil && err == nil {
+		// 与 wsjson.Write 相同的编码方式（json.Encoder，含末尾换行），保证归档字节一致。
+		var buf bytes.Buffer
+		if json.NewEncoder(&buf).Encode(value) == nil {
+			c.tap.Sent(ctx, audit.WSOpText, buf.Bytes())
+		}
+	}
+	return err
 }
 
 func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
@@ -324,6 +351,7 @@ func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
+	c.tap.Received(ctx, auditWSOp(msgType), payload)
 	switch msgType {
 	case coderws.MessageText, coderws.MessageBinary:
 		return payload, nil
@@ -343,6 +371,7 @@ func (c *coderOpenAIWSClientConn) ReadFrame(ctx context.Context) (coderws.Messag
 	if err != nil {
 		return coderws.MessageText, nil, err
 	}
+	c.tap.Received(ctx, auditWSOp(msgType), payload)
 	return msgType, payload, nil
 }
 
@@ -353,7 +382,11 @@ func (c *coderOpenAIWSClientConn) WriteFrame(ctx context.Context, msgType coderw
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return c.conn.Write(ctx, msgType, payload)
+	err := c.conn.Write(ctx, msgType, payload)
+	if err == nil {
+		c.tap.Sent(ctx, auditWSOp(msgType), payload)
+	}
+	return err
 }
 
 func (c *coderOpenAIWSClientConn) Ping(ctx context.Context) error {
@@ -386,6 +419,7 @@ func (c *coderOpenAIWSClientConn) Close() error {
 	// Close 为幂等，忽略重复关闭错误。
 	_ = c.conn.Close(coderws.StatusNormalClosure, "")
 	_ = c.conn.CloseNow()
+	c.tap.Closed("")
 	return nil
 }
 
@@ -394,5 +428,6 @@ func (c *coderOpenAIWSClientConn) CloseNow() error {
 		return nil
 	}
 	_ = c.conn.CloseNow()
+	c.tap.Closed("connection closed without close handshake")
 	return nil
 }

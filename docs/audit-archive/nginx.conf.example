@@ -1,0 +1,60 @@
+# Sub2API 请求报文归档：Nginx 转发层示例
+#
+# 原则：
+#   - 存储压缩（zstd，落盘）由后端负责；
+#   - 上游内容编码（Content-Encoding）按原样归档，展示阶段才解码；
+#   - 传输压缩只在这里按客户端 Accept-Encoding 协商，前端不手动解压；
+#   - 模型网关（SSE / WebSocket）不压缩、不缓冲，不受归档接口配置影响。
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+upstream sub2api {
+    server 127.0.0.1:8080;
+    keepalive 64;
+}
+
+server {
+    listen 80;
+    server_name _;
+    client_max_body_size 256m;
+
+    # 归档查看 / 下载接口：JSON 与原始正文由 Nginx 按协议协商压缩
+    location /api/v1/admin/audit-archive/ {
+        proxy_pass http://sub2api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering on;
+        proxy_read_timeout 300s;
+
+        gzip on;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_types application/json application/octet-stream text/plain;
+        # 若已编译 ngx_brotli，可追加：
+        # brotli on; brotli_types application/json application/octet-stream text/plain;
+    }
+
+    # 其余（模型网关 + 管理台）：保持实时，不改变 SSE / WebSocket 行为
+    location / {
+        proxy_pass http://sub2api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

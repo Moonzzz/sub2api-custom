@@ -150,10 +150,11 @@ const (
 	usageLogCreateStateCanceled
 )
 
-func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) (bool, error) {
+func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) (inserted bool, err error) {
 	if log == nil {
 		return false, nil
 	}
+	defer func() { auditUsageWritten(ctx, log, inserted, err) }()
 
 	if tx := dbent.TxFromContext(ctx); tx != nil {
 		return r.createSingle(ctx, tx.Client(), log)
@@ -166,10 +167,12 @@ func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) 
 	return r.createBatched(ctx, log)
 }
 
-func (r *usageLogRepository) CreateBestEffort(ctx context.Context, log *service.UsageLog) error {
+func (r *usageLogRepository) CreateBestEffort(ctx context.Context, log *service.UsageLog) (err error) {
 	if log == nil {
 		return nil
 	}
+	// best-effort 批量路径的 ON CONFLICT 结果不回传，按“写入已返回”记录。
+	defer func() { auditUsageWritten(ctx, log, true, err) }()
 
 	if tx := dbent.TxFromContext(ctx); tx != nil {
 		_, err := r.createSingle(ctx, tx.Client(), log)
